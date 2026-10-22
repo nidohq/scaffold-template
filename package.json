@@ -31,7 +31,7 @@
     "vendor/*"
   ],
   "devDependencies": {
-    "prettier": "^3.8.3",
+    "prettier": "^3.9.10",
     "vitest": "^4.1.0",
     "yaml": "^2.9.1"
   },

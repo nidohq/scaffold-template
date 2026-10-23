@@ -55,6 +55,11 @@ export interface Grant {
 	 * Without one, the app tells Nido the rule is uncapped; Nido asks the
 	 * owner to accept that unless the rule's functions cannot move tokens. */
 	limit?: { amount: string; period: LimitPeriod }
+	/** The only address `transfer` may pay (`G…` or `C…`): an `address-eq`
+	 * on its argument 1. Only on a grant whose functions are exactly
+	 * `["transfer"]`. Without it a transfer grant can pay anyone, up to its
+	 * cap. */
+	to?: string
 	/** Rule name in the account's policy document, at most 20 bytes. Nido
 	 * replaces an existing rule with the same name. */
 	label: string
@@ -120,6 +125,9 @@ export interface InstalledRule {
 	functions: string[] | undefined
 	/** The rule's cumulative cap, from the document, in the token's units. */
 	cap?: { limit: bigint; periodLedgers: number }
+	/** The only address its `transfer` may pay, from the document's
+	 * `address-eq` on argument 1. */
+	to?: string
 	/** The policy contracts attached to the rule. */
 	policies: string[]
 	/** The rule's `External` signers: verifier contract and key data (hex). */
@@ -218,7 +226,9 @@ function allows(held: Grant, wanted: Grant): boolean {
 		? wanted.limit?.amount === held.limit.amount &&
 			wanted.limit.period === held.limit.period
 		: !wanted.limit
-	return Boolean(functions) && limit
+	// A changed recipient asks again, either way: a rule that pays anyone is
+	// not what a grant naming one address asked for
+	return Boolean(functions) && limit && held.to === wanted.to
 }
 
 /**
@@ -471,16 +481,24 @@ export function grantUrl(args: {
 			field("limit", grant.limit.amount)
 			field("limit_period", grant.limit.period)
 		} else field("limit", "none")
+		if (grant.to) {
+			if (grant.functions?.join() !== "transfer")
+				throw new Error(
+					`Grant "${grant.label}" names a recipient, so its functions must be exactly ["transfer"]`,
+				)
+			field("to", grant.to)
+		}
 	})
 	set("return", returnUrl)
 	return url.toString()
 }
 
-const asked = ({ target, functions, duration, limit, label }: Grant) => ({
+const asked = ({ target, functions, duration, limit, to, label }: Grant) => ({
 	target,
 	...(functions ? { functions } : {}),
 	duration,
 	...(limit ? { limit } : {}),
+	...(to ? { to } : {}),
 	label,
 })
 
@@ -613,7 +631,8 @@ function record(
 	const now = Date.now()
 	for (const grant of waiting) {
 		grant.expiresAt = now + DURATION_MS[grant.duration]
-		// A new rule starts a new cap
+		// Forget a spent cap here; the next call reads it again (re-approving
+		// keeps the rule's spending record, so it may still be spent)
 		delete session.capped?.[grant.label]
 	}
 	saveSession(session)
@@ -647,6 +666,7 @@ export async function checkSession(
 			(r) =>
 				r.name === g.label &&
 				r.contract === g.target &&
+				r.to === g.to &&
 				(r.functions === undefined ||
 					(g.functions?.every((f) => r.functions!.includes(f)) ?? false)) &&
 				signedBy(r, session.passkey),
@@ -858,6 +878,7 @@ type NativeRule = {
 type DocRule = {
 	name: string
 	functions?: string[]
+	args?: { index: number; pred: { type: string; address?: string } }[]
 	cap?: { limit: string; "period-ledgers": number }
 	scope: { type: string; address?: string }
 }
@@ -887,6 +908,10 @@ export function parseRules(
 		const written = doc?.rules.find(
 			(r) => r.name === String(rule.name) && r.scope.address === contract,
 		)
+		// SEP-41 transfer(from, to, amount): `to` is argument 1
+		const to = written?.args?.find(
+			(a) => a.index === 1 && a.pred.type === "address-eq",
+		)?.pred.address
 		return {
 			id: Number(rule.id),
 			name: String(rule.name),
@@ -900,6 +925,7 @@ export function parseRules(
 						},
 					}
 				: {}),
+			...(to ? { to } : {}),
 			policies: (rule.policies ?? []).map((p) => String(p.policy)),
 			external: signers.flatMap((s) =>
 				s?.[0] === "External"

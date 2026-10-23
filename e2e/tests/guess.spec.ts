@@ -129,6 +129,7 @@ test("a Nido account approves the game's passkey once, then each guess asks only
 		functions: "guess",
 		limit: "none",
 	})
+	// …and the XLM rule pays only the game
 	expect(xlm).toEqual({
 		pubkey,
 		duration: "24h",
@@ -137,6 +138,7 @@ test("a Nido account approves the game's passkey once, then each guess asks only
 		functions: "transfer",
 		limit: "2",
 		limit_period: "day",
+		to: game!.target,
 	})
 	// Nothing secret in the browser: the passkey's public half only
 	const stored = await page.evaluate(

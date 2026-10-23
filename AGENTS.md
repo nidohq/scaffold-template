@@ -154,6 +154,10 @@ contract, #3014 for several). An app acts for a Nido account through a session.
   a grant whose `target` is that token contract (`xlmTokenId` for XLM). A grant
   without `limit` is sent as `limit=none`; Nido asks the owner to accept "no
   cap" unless its `functions` move no tokens.
+- `to` (on a grant whose `functions` are exactly `["transfer"]`) is the only
+  address that transfer may pay: an `address-eq` on argument 1. Set it to your
+  contract for a payment grant; without it the passkey can pay anyone up to the
+  cap, because rules are checked per call, not per call tree.
 - `label` ≤ 20 bytes; asking again with the same label replaces that rule.
   `duration` is `24h`, `7d` or `30d`, shared by the grants of one request.
 - The session signer is a second passkey the device makes for the app on its own

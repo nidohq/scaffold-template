@@ -143,6 +143,15 @@ describe("asking Nido for grants", () => {
 			`http://${account.toLowerCase()}.localhost:4321`,
 		)
 	})
+	it("names the only address a transfer grant may pay", () => {
+		const url = ask("https://test.nido.fyi", [play, { ...spend, to: app }])
+		expect(url.searchParams.get("grant.1.to")).toBe(app)
+		expect(url.searchParams.has("grant.0.to")).toBe(false)
+		// Nido takes `to` only on a grant whose functions are exactly transfer
+		expect(() => ask("https://test.nido.fyi", [{ ...play, to: app }])).toThrow(
+			/exactly \["transfer"\]/,
+		)
+	})
 	it("refuses requests Nido would reject", () => {
 		const long = { ...play, label: "a label that is far too long" }
 		expect(() => ask("https://test.nido.fyi", [long])).toThrow(/20 bytes/)
@@ -360,6 +369,7 @@ describe("session authorization", () => {
 						{
 							name: "probe",
 							functions: ["transfer"],
+							args: [{ index: 1, pred: { type: "address-eq", address: app } }],
 							cap: { limit: "20000000", "period-ledgers": 17280 },
 							scope: { type: "contract", address: sac },
 						},
@@ -374,6 +384,7 @@ describe("session authorization", () => {
 				contract: sac,
 				functions: ["transfer"],
 				cap: { limit: 20_000_000n, periodLedgers: 17_280 },
+				to: app,
 				policies: [app],
 				external: [{ verifier, key: keyData }],
 				delegated: [],
@@ -418,11 +429,11 @@ describe("session coverage", () => {
 		const moved = { ...play, target: sac }
 		const wider = { ...play, functions: ["play", "reset"] }
 		const capped = { ...spend, limit: { amount: "5", period: "day" as const } }
-		expect(sessionCovers(session, [moved, wider, capped], now).ask).toEqual([
-			moved,
-			wider,
-			capped,
-		])
+		// An approval that pays anyone is not one that pays only the game
+		const payee = { ...spend, to: app }
+		expect(
+			sessionCovers(session, [moved, wider, capped, payee], now).ask,
+		).toEqual([moved, wider, capped, payee])
 		expect(sessionCovers(session, [play], now + hour).expired).toEqual([play])
 	})
 	it("tells a gate whether to make a passkey, ask, wait, renew or go ahead", () => {
@@ -647,6 +658,56 @@ const installed = (
 	)
 
 describe("checking the chain for what landed", () => {
+	it("counts a grant that names a recipient only when the rule pays that address", async () => {
+		const server = (args: object[] | undefined) =>
+			({
+				simulateTransaction: vi.fn(
+					async (tx: { operations: Operation.InvokeHostFunction[] }) =>
+						tx.operations[0]!.func.invokeContract()
+							.functionName()
+							.toString() === "document"
+							? simulated(
+									xdr.ScVal.scvVec([
+										nativeToScVal(1, { type: "u64" }),
+										nativeToScVal(
+											Buffer.from(
+												JSON.stringify({
+													rules: [
+														{
+															name: "spend",
+															functions: ["transfer"],
+															...(args ? { args } : {}),
+															scope: { type: "contract", address: sac },
+														},
+													],
+												}),
+											),
+										),
+									]),
+								)
+							: simulated(
+									installed([
+										{ id: 3, name: "spend", contract: sac, key: keyData },
+									]),
+								),
+				),
+			}) as unknown as rpc.Server
+		store([{ ...spend, to: app }])
+		// A rule by that name that pays anyone isn't the one asked for
+		expect(
+			await checkSession(account, server(undefined), Networks.TESTNET),
+		).toEqual({
+			approved: 0,
+			waiting: 1,
+		})
+		const payee = [{ index: 1, pred: { type: "address-eq", address: app } }]
+		expect(
+			await checkSession(account, server(payee), Networks.TESTNET),
+		).toEqual({
+			approved: 1,
+			waiting: 0,
+		})
+	})
 	it("approves grants found on chain and drops replaced ones", async () => {
 		store([{ ...play, expiresAt: Date.now() + hour }, spend])
 		localStorage.setItem(pending, account)

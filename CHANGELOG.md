@@ -32,6 +32,23 @@
   guesses with one device prompt each (fees 0.565 and 0.035 XLM, paid by Nido's
   relayer), the third refused by the 2 XLM/day cap.
 
+### The XLM rule pays only the game
+
+- A `Grant` can name `to`, the only address its `transfer` may pay. The app
+  sends it as `grant.<i>.to` (Nido PR 318), which Nido writes as an `address-eq`
+  on transfer's argument 1, and shows as "Pays to: Only <game>". Guess the
+  Number's XLM grant names the game, so its passkey can no longer send the 2 XLM
+  a day to anyone else. `to` is only allowed on a grant whose functions are
+  exactly `["transfer"]`.
+- The app reads `to` back from the account's document, so `checkSession`,
+  coverage and rule selection see it. A grant whose `to` changed counts as
+  changed: a session approved before this asks again for its XLM rule, once.
+- Verified on testnet against Nido's preview (`429c276f`): re-approving the
+  walkthrough account's XLM rule showed "pays: any address → only CBY4S4…" in
+  Nido's diff and cost 0.328 XLM; on a fresh account the first approval cost
+  7.524 XLM (7.192 without `to`), and a wrong guess paid the game
+  (`66f821e6…4d4e`, account 5 → 4 XLM, game 2 → 3 XLM, fee 0.567 XLM).
+
 ### The right rule, and a spent cap said before the prompt
 
 - The app picks the rule for each call by contract and function, reading the
@@ -45,7 +62,9 @@
   refusal is remembered per grant; `capReachedUntil(address, grants)` returns it
   until then. Guess the Number shows "Cap reached until ≈ …" and keeps Submit
   off, across reloads, instead of asking the device for a guess the account
-  would refuse. Approving the grant again clears it.
+  would refuse. Approving the grant again clears the memory, and the next guess
+  reads the cap again: on testnet, re-approving a rule kept its id and its
+  spending record, so renewing doesn't refresh the cap.
 - The last guess's result sits inside the `SessionGate`, so the renew screen no
   longer shows a stale refusal under it.
 

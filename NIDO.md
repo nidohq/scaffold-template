@@ -221,6 +221,12 @@ The rules that follow from it:
   cap as `limit=none`; Nido takes that without asking when the grant's
   `functions` move no tokens (like `guess`), and otherwise asks the owner to
   choose a cap or accept "no cap" explicitly.
+- **`to`** names the only address a grant's `transfer` may pay, on a grant whose
+  `functions` are exactly `["transfer"]`. Nido shows it as "Pays to", and the
+  account checks it on every call. Without it a transfer grant can pay any
+  address, up to its cap. A rule is checked per call, not per call tree, so the
+  passkey could call `transfer` outside a guess too; with `to` set to the game,
+  that can only pay the game.
 - **`label`** is the rule's name, at most 20 bytes. Asking again with the same
   label replaces that rule, which is how the app renews an expired one.
   `duration` is `24h`, `7d` or `30d`, and the grants in one request share it.
@@ -248,9 +254,10 @@ Some patterns that work:
 - **An action that moves no money** (claim, vote, check in): one grant on your
   contract, no cap. The `--blank` starter is this.
 - **A capped payment** (tip, buy): two grants, your contract plus the token with
-  a `limit`, approved together. Guess the Number is this: 1 XLM a wrong guess,
-  capped at 2 XLM a day. Its `period` matches the grant's 24-hour `duration`, so
-  the cap is also the most one approval can spend.
+  a `limit` and `to` set to your contract, approved together. Guess the Number
+  is this: 1 XLM a wrong guess, only to the game, capped at 2 XLM a day. Its
+  `period` matches the grant's 24-hour `duration`, so the cap is also the most
+  one approval can spend. Re-approving keeps the cap's spending record.
 - **Shared funds** (a group pot): your contract holds the money and pays out
   when enough members approve; each member uses their own Nido account.
 - **Limits for someone else** (an allowance): a cap limits a key, not the
@@ -324,14 +331,16 @@ passkeys (`npm run test-browser`), against Nido's preview of grant requests with
 several grants and a passkey signer
 (`PUBLIC_NIDO_BASE=https://318.test.nido.fyi`):
 
-| Check (2026-10-23)                | Result                                                                                                                        |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Create a Nido account             | Deployed and funded with 5 XLM by Nido's relayer                                                                              |
-| Connect through the wallet picker | C-address and its 5 XLM balance in the header                                                                                 |
-| Make the app's passkey            | One device prompt; `localStorage` holds its public key and credential id only                                                 |
-| Approve the session               | One popup, both rules and the 2 XLM/day cap already filled in, one confirmation; `guess` and `guess-xlm` name the app passkey |
-| Guess 1 and guess 2               | One device prompt each, no Nido page; submitted by Nido's relayer: 0.565 and 0.035 XLM in fees, paid by the relayer           |
-| Guess 3                           | Refused by the account: `#3221` (`SpendingLimitExceeded`); nothing sent, balance unchanged at 3 XLM                           |
+| Check (2026-10-23)                        | Result                                                                                                                            |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Create a Nido account                     | Deployed and funded with 5 XLM by Nido's relayer                                                                                  |
+| Connect through the wallet picker         | C-address and its 5 XLM balance in the header                                                                                     |
+| Make the app's passkey                    | One device prompt; `localStorage` holds its public key and credential id only                                                     |
+| Approve the session                       | One popup, both rules and the 2 XLM/day cap already filled in, one confirmation; `guess` and `guess-xlm` name the app passkey     |
+| Guess 1 and guess 2                       | One device prompt each, no Nido page; submitted by Nido's relayer: 0.565 and 0.035 XLM in fees, paid by the relayer               |
+| Guess 3                                   | Refused by the account: `#3221` (`SpendingLimitExceeded`); nothing sent, balance unchanged at 3 XLM                               |
+| Pay only the game (`to`, Nido `429c276f`) | Nido shows "Pays to: Only CBY4…" and, re-approving, "pays: any address → only CBY4S4…"; a wrong guess paid the game (`66f821e6…`) |
+| Re-approve a spent cap                    | Same rule id, same spending record: still "Cap reached", refused before any prompt                                                |
 
 Guesses `a5966b61fe9f47b804ddeeece967674c576e3c6c3834914e9532e86e4e13ce97` and
 `f912bd60e709c099203dea8aa4ffb485cda85111792a31c973fbeeef8d64452a`.

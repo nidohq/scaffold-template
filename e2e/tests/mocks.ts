@@ -248,6 +248,11 @@ function document(grants: AskedGrant[]) {
 		name: g.label,
 		scope: { type: "contract", address: g.target },
 		...(g.functions ? { functions: g.functions.split(",") } : {}),
+		...(g.to
+			? {
+					args: [{ index: 1, pred: { type: "address-eq", address: g.to } }],
+				}
+			: {}),
 		...(capped(g)
 			? {
 					cap: {

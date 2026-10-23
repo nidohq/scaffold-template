@@ -1,4 +1,6 @@
 import {
+	CapReachedError,
+	capReachedUntil,
 	describe,
 	isOverCap,
 	submitCall,
@@ -8,6 +10,7 @@ import {
 } from "@stellar-scaffold/app-lib"
 import { guessTheNumber } from "@stellar-scaffold/app-lib/clients"
 import { useState, type FormEvent } from "react"
+import { useSessionClock } from "../hooks/useSessionStatus"
 import { useWallet } from "../hooks/useWallet"
 import { Pending, stageText } from "./Pending"
 import { SessionGate } from "./SessionGate"
@@ -35,8 +38,18 @@ const grants: Grant[] = [
 	},
 ]
 
+const time = new Intl.DateTimeFormat(undefined, {
+	weekday: "short",
+	hour: "numeric",
+	minute: "2-digit",
+})
+
 export const GuessTheNumber = () => {
 	const { address, updateBalances } = useWallet()
+	// When the account last refused a guess for the cap, until it frees up:
+	// say so and keep Submit off, rather than asking the device again
+	const now = useSessionClock()
+	const capUntil = address ? capReachedUntil(address, grants, now) : undefined
 	const [error, setError] = useState<string>()
 	const [hash, setHash] = useState<string>()
 	const [result, setResult] = useState<"idle" | "success" | "failure">("idle")
@@ -77,9 +90,11 @@ export const GuessTheNumber = () => {
 		} catch (e) {
 			console.error(e)
 			setError(
-				isOverCap(e)
-					? `That's the ${dailyCap} XLM a day you let this game spend, so your account stopped this guess before anything was sent. It cost nothing. Come back tomorrow for more guesses.`
-					: describe(e),
+				e instanceof CapReachedError
+					? `That's the ${dailyCap} XLM a day you let this game spend, so the guess stopped before your device was asked or anything was sent. It cost nothing.`
+					: isOverCap(e)
+						? `That's the ${dailyCap} XLM a day you let this game spend, so your account stopped this guess before anything was sent. It cost nothing. Come back tomorrow for more guesses.`
+						: describe(e),
 			)
 			setResult("failure")
 		} finally {
@@ -119,7 +134,7 @@ export const GuessTheNumber = () => {
 						onChange={reset}
 						readOnly={!!stage}
 					/>
-					<button type="submit" disabled={!!stage}>
+					<button type="submit" disabled={!!stage || !!capUntil}>
 						{stage ? (
 							<>
 								<span className="spinner" aria-hidden="true" />
@@ -131,32 +146,42 @@ export const GuessTheNumber = () => {
 					</button>
 				</form>
 				{stage && <Pending>{stageText[stage]}</Pending>}
-			</SessionGate>
-
-			{result === "success" && (
-				<div className="card guess-result guess-result--success">
-					<p>
-						You got it! Play again by calling <code>reset</code> in the Contract
-						Explorer.
+				{capUntil && !stage && (
+					<p className="session-note" role="status">
+						Cap reached
+						{capUntil < Number.MAX_SAFE_INTEGER &&
+							` until ≈ ${time.format(capUntil)}`}
+						: your account lets this game spend {dailyCap} XLM in any 24 hours.
 					</p>
-				</div>
-			)}
-			{result === "failure" && (
-				<div className="card guess-result guess-result--failure">
-					{error ? (
-						<p role="alert">{error}</p>
-					) : !address ? (
-						<p>Connect to your wallet in order to guess.</p>
-					) : (
-						<p>Incorrect guess: that cost 1 XLM. Try again!</p>
-					)}
-				</div>
-			)}
-			{hash && !stage && (
-				<p className="session-note">
-					Transaction <code>{hash}</code>
-				</p>
-			)}
+				)}
+
+				{/* Inside the gate, so an expired or changed session hides the
+				    last result along with the form */}
+				{result === "success" && (
+					<div className="card guess-result guess-result--success">
+						<p>
+							You got it! Play again by calling <code>reset</code> in the
+							Contract Explorer.
+						</p>
+					</div>
+				)}
+				{result === "failure" && (
+					<div className="card guess-result guess-result--failure">
+						{error ? (
+							<p role="alert">{error}</p>
+						) : !address ? (
+							<p>Connect to your wallet in order to guess.</p>
+						) : (
+							<p>Incorrect guess: that cost 1 XLM. Try again!</p>
+						)}
+					</div>
+				)}
+				{hash && !stage && (
+					<p className="session-note">
+						Transaction <code>{hash}</code>
+					</p>
+				)}
+			</SessionGate>
 		</div>
 	)
 }

@@ -175,10 +175,13 @@ Everything here comes from `@stellar-scaffold/app-lib` (the template's
   expired; #3014 a contract in the call has no rule), Nido's relayer codes, and
   your contract's `Error(Contract, #n)` looked up in `contractErrors` (the
   generated client's `Errors`, or your own table).
-- `isOverCap(error)` is true when the account refused a call for going over a
-  grant's cap (#3221), so you can say what the cap was and when to come back.
-  The account checks during simulation, after the device signed, so nothing was
-  sent or paid.
+- `isOverCap(error)` is true when a call was refused for going over a grant's
+  cap (#3221), so you can say what the cap was and when to come back. The app
+  reads the cap's record first: a call that would go over stops before the
+  device is asked (`CapReachedError`, with `until`), and
+  `capReachedUntil(address, grants)` remembers when the cap frees up, so a
+  screen can say "Cap reached until ≈ …" and keep its button off. The account
+  checks again in simulation; either way nothing is sent or paid.
 - `isSmartAccount(address)` tells a Nido C-address from a classic G-address, for
   example to link `/contract/` rather than `/account/` on an explorer.
 
@@ -201,9 +204,11 @@ passkey:
    its relayer. The rules name the app's passkey as an `External` signer,
    checked by the same WebAuthn verifier as the owner's.
 3. For each later call the app asks the device to sign the account's auth entry
-   with its passkey (one prompt), naming the approved rule for each contract.
-   The account checks the signature, the rules and the cap in a simulation, then
-   Nido's relayer submits the call and pays the fee.
+   with its passkey (one prompt), naming the approved rule for each call: on
+   that contract, allowing that function (from the account's policy document),
+   and one of this app's own grants when another rule on the same contract names
+   the same passkey. The account checks the signature, the rules and the cap in
+   a simulation, then Nido's relayer submits the call and pays the fee.
 
 The rules that follow from it:
 

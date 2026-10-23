@@ -230,29 +230,53 @@ test("a Nido account approves the game's passkey once, then each guess asks only
 	})
 })
 
-test("over the 2 XLM cap, the account refuses, nothing is sent, and the player is told why", async ({
+test("over the 2 XLM cap, the guess stops before the device is asked, and Submit waits for the cap", async ({
 	page,
 	context,
 }) => {
-	let overCap = false
-	const { relayed } = await mockServices(context, {
-		auth: guessAuth,
-		refuse: () => (overCap ? "HostError: Error(Contract, #3221)" : undefined),
-	})
+	const { relayed } = await mockServices(context, { auth: guessAuth })
 	await virtualAuthenticator(page)
+	await countPrompts(page)
 	await connect(page)
 	await approveOnce(page)
 	await guess(page, 3)
 	await guess(page, 5)
 	expect(relayed).toHaveLength(2)
 
-	overCap = true
+	// The cap's record says 2 XLM went out today: no prompt, nothing sent
 	await guess(page, 7, "the 2 XLM a day you let this game spend")
-	await expect(page.getByRole("alert")).toContainText("It cost nothing")
+	await expect(page.getByRole("alert")).toContainText(
+		"stopped before your device was asked",
+	)
+	expect(await prompts(page)).toBe(2)
 	expect(relayed).toHaveLength(2)
-	// The refusal ends the wait: nothing still says it is under way
-	await expect(page.getByRole("button", { name: "Submit" })).toBeEnabled()
 	await expect(page.locator(".guess-the-number .pending")).toHaveCount(0)
+	// It says when guessing works again, and doesn't let the player try sooner,
+	// even after a reload
+	const capped = page.getByText(/^Cap reached until ≈ /)
+	await expect(capped).toBeVisible()
+	await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled()
+	await page.reload()
+	await expect(capped).toBeVisible()
+	await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled()
+
+	// Once the approval expires, the renew screen replaces the form and
+	// the last result with it
+	await page.getByPlaceholder("Guess a number from 1 to 10!").fill("2")
+	await page.evaluate((a) => {
+		const key = `scaffold:nido-session:${a}`
+		const session = JSON.parse(localStorage.getItem(key)!) as {
+			grants: { expiresAt?: number }[]
+		}
+		for (const grant of session.grants) grant.expiresAt = Date.now() - 1_000
+		localStorage.setItem(key, JSON.stringify(session))
+		dispatchEvent(new Event("scaffold:nido-session-change"))
+	}, account)
+	await expect(
+		page.getByRole("button", { name: /^Renew with Nido/ }),
+	).toBeVisible()
+	await expect(page.locator(".guess-result")).toHaveCount(0)
+	await expect(capped).toHaveCount(0)
 })
 
 test("a cancelled approval keeps the game's passkey for the next try", async ({

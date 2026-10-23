@@ -85,6 +85,9 @@ export interface Session {
 	/** Why the last approval did not land, as Nido reported it (a code such as
 	 * `FEE_LIMIT_EXCEEDED`, or a message). */
 	refused?: string
+	/** Grants whose spending cap refused a call, by label: when the cap lets
+	 * one through again, in ms since the epoch. */
+	capped?: Record<string, number>
 }
 
 /** What a gate should show for the grants it needs. */
@@ -112,6 +115,13 @@ export interface InstalledRule {
 	name: string
 	/** The contract the rule applies to; `undefined` for any other scope. */
 	contract: string | undefined
+	/** The functions the rule allows, from the account's policy document;
+	 * `undefined` for any function, or for a rule the document doesn't list. */
+	functions: string[] | undefined
+	/** The rule's cumulative cap, from the document, in the token's units. */
+	cap?: { limit: bigint; periodLedgers: number }
+	/** The policy contracts attached to the rule. */
+	policies: string[]
 	/** The rule's `External` signers: verifier contract and key data (hex). */
 	external: { verifier: string; key: string }[]
 	/** `G…`/`C…` addresses of the rule's `Delegated` signers. */
@@ -601,8 +611,11 @@ function record(
 		}
 	}
 	const now = Date.now()
-	for (const grant of waiting)
+	for (const grant of waiting) {
 		grant.expiresAt = now + DURATION_MS[grant.duration]
+		// A new rule starts a new cap
+		delete session.capped?.[grant.label]
+	}
 	saveSession(session)
 	return { account, outcome: "approved" }
 }
@@ -634,8 +647,11 @@ export async function checkSession(
 			(r) =>
 				r.name === g.label &&
 				r.contract === g.target &&
+				(r.functions === undefined ||
+					(g.functions?.every((f) => r.functions!.includes(f)) ?? false)) &&
 				signedBy(r, session.passkey),
 		)
+		if (rule && g.expiresAt === undefined) delete session.capped?.[g.label]
 		if (rule)
 			return [
 				{
@@ -663,19 +679,33 @@ export async function checkSession(
 
 // --- Authorization -----------------------------------------------------------
 
-/** Contract addresses an auth entry authorizes, in the order the host passes
- * them to `__check_auth`: the root call, then its sub-calls depth first. */
+/** One call an auth entry authorizes, as `__check_auth` sees it. */
+export interface AuthContext {
+	/** The contract called, or `create-contract` for a deployment. */
+	contract: string
+	fn: string
+	args: xdr.ScVal[]
+}
+
+/** The calls an auth entry authorizes, in the order the host passes them to
+ * `__check_auth`: the root call, then its sub-calls depth first. */
 export function authContexts(
 	invocation: xdr.SorobanAuthorizedInvocation,
-): string[] {
+): AuthContext[] {
 	const fn = invocation.function()
-	const own =
+	const own: AuthContext =
 		fn.switch().value ===
 		xdr.SorobanAuthorizedFunctionType.sorobanAuthorizedFunctionTypeContractFn()
 			.value
-			? [Address.fromScAddress(fn.contractFn().contractAddress()).toString()]
-			: ["create-contract"]
-	return [...own, ...invocation.subInvocations().flatMap(authContexts)]
+			? {
+					contract: Address.fromScAddress(
+						fn.contractFn().contractAddress(),
+					).toString(),
+					fn: fn.contractFn().functionName().toString(),
+					args: fn.contractFn().args(),
+				}
+			: { contract: "create-contract", fn: "", args: [] }
+	return [own, ...invocation.subInvocations().flatMap(authContexts)]
 }
 
 /** Whether `passkey` is one of `rule`'s `External` signers. Its key data is
@@ -684,26 +714,32 @@ const signedBy = (rule: InstalledRule, passkey: SessionPasskey) =>
 	rule.external.some((s) => s.key.slice(0, 130) === passkey.publicKey)
 
 /**
- * For each context, the rule that lets `passkey` act there. Throws, naming
- * the contract, when no unexpired rule covers a context: the app needs another
- * grant before it can make this call.
+ * For each context, the rule that lets `passkey` make that call: on that
+ * contract, allowing that function, unexpired. Another rule on the same
+ * contract (another gate's, or one left from an earlier approval) could
+ * charge the wrong cap or miss a constraint, so a rule named in `labels`, the
+ * grants this app asked for, wins over any other. Throws, naming the call,
+ * when no rule covers a context: the app needs another grant first.
  */
 export function ruleIdsFor(
-	contexts: string[],
+	contexts: AuthContext[],
 	rules: InstalledRule[],
 	passkey: SessionPasskey,
 	ledger: number,
+	labels: string[] = [],
 ): number[] {
-	return contexts.map((target) => {
-		const rule = rules.find(
+	return contexts.map(({ contract, fn }) => {
+		const fits = rules.filter(
 			(r) =>
-				r.contract === target &&
+				r.contract === contract &&
+				(r.functions === undefined || r.functions.includes(fn)) &&
 				signedBy(r, passkey) &&
 				(r.validUntil === undefined || r.validUntil >= ledger),
 		)
+		const rule = fits.find((r) => labels.includes(r.name)) ?? fits[0]
 		if (!rule)
 			throw new Error(
-				`This app's session does not cover calls to ${target} (or it expired). Ask for a grant on that contract.`,
+				`This app's session does not cover ${fn} on ${contract} (or it expired). Ask for a grant on that contract.`,
 			)
 		return rule.id
 	})
@@ -814,7 +850,16 @@ type NativeRule = {
 	name: string
 	context_type: unknown
 	signers: unknown[]
+	policies?: { policy: string }[]
 	valid_until?: number | null
+}
+
+/** The parts of a policy-document rule (`document()`) this app reads. */
+type DocRule = {
+	name: string
+	functions?: string[]
+	cap?: { limit: string; "period-ledgers": number }
+	scope: { type: string; address?: string }
 }
 
 /** A contract enum variant as `[tag, ...fields]`, from either shape
@@ -828,15 +873,34 @@ const variant = (v: unknown): unknown[] | undefined => {
 		: [tag, ...(Array.isArray(fields) ? fields : [fields])]
 }
 
-/** Decode `installed_rules()` output (`scValToNative` form). */
-export function parseRules(native: NativeRule[]): InstalledRule[] {
+/** Decode `installed_rules()` output (`scValToNative` form), with each rule's
+ * functions and cap from the account's policy document when it has one. */
+export function parseRules(
+	native: NativeRule[],
+	doc?: { rules: DocRule[] },
+): InstalledRule[] {
 	return native.map((rule) => {
 		const scope = variant(rule.context_type)
 		const signers = rule.signers.map(variant)
+		const contract =
+			scope?.[0] === "CallContract" ? String(scope[1]) : undefined
+		const written = doc?.rules.find(
+			(r) => r.name === String(rule.name) && r.scope.address === contract,
+		)
 		return {
 			id: Number(rule.id),
 			name: String(rule.name),
-			contract: scope?.[0] === "CallContract" ? String(scope[1]) : undefined,
+			contract,
+			functions: written?.functions,
+			...(written?.cap
+				? {
+						cap: {
+							limit: BigInt(written.cap.limit),
+							periodLedgers: written.cap["period-ledgers"],
+						},
+					}
+				: {}),
+			policies: (rule.policies ?? []).map((p) => String(p.policy)),
 			external: signers.flatMap((s) =>
 				s?.[0] === "External"
 					? [{ verifier: String(s[1]), key: toHex(s[2] as Uint8Array) }]
@@ -886,19 +950,98 @@ async function read(
 	}
 }
 
-/** Read the account's installed rules. */
+/** Read the account's installed rules, with their functions and caps from
+ * its policy document (`document()`: revision, canonical JSON as bytes). */
 export async function readRules(
 	account: string,
 	server: rpc.Server,
 	networkPassphrase: string,
 ): Promise<{ rules: InstalledRule[]; latestLedger: number }> {
-	const { value, latestLedger } = await read(
-		account,
-		"installed_rules",
-		server,
-		networkPassphrase,
+	const [installed, written] = await Promise.all([
+		read(account, "installed_rules", server, networkPassphrase),
+		read(account, "document", server, networkPassphrase).catch(() => undefined),
+	])
+	const bytes = Array.isArray(written?.value) ? written.value[1] : undefined
+	const json =
+		bytes instanceof Uint8Array ? new TextDecoder().decode(bytes) : undefined
+	return {
+		rules: parseRules(
+			installed.value as NativeRule[],
+			json ? (JSON.parse(json) as { rules: DocRule[] }) : undefined,
+		),
+		latestLedger: installed.latestLedger,
+	}
+}
+
+/** A cap's recent spending, as its `spending_limit` policy stores it. */
+export interface CapWindow {
+	limit: bigint
+	periodLedgers: number
+	spent: { amount: bigint; ledger: number }[]
+}
+
+/** The spending window of `rule`'s cap on `account`, read from its policy's
+ * storage (`AccountContext(account, rule id)`); `undefined` before the first
+ * spend. */
+async function readCapWindow(
+	account: string,
+	rule: InstalledRule,
+	server: rpc.Server,
+): Promise<CapWindow | undefined> {
+	const key = xdr.ScVal.scvVec([
+		xdr.ScVal.scvSymbol("AccountContext"),
+		new Address(account).toScVal(),
+		xdr.ScVal.scvU32(rule.id),
+	])
+	const { entries } = await server.getLedgerEntries(
+		...rule.policies.map((policy) =>
+			xdr.LedgerKey.contractData(
+				new xdr.LedgerKeyContractData({
+					contract: new Address(policy).toScAddress(),
+					key,
+					durability: xdr.ContractDataDurability.persistent(),
+				}),
+			),
+		),
 	)
-	return { rules: parseRules(value as NativeRule[]), latestLedger }
+	const entry = entries[0]
+	if (!entry) return undefined
+	const data = scValToNative(entry.val.contractData().val()) as {
+		spending_limit: bigint
+		period_ledgers: number
+		spending_history: { amount: bigint; ledger_sequence: number }[]
+	}
+	return {
+		limit: BigInt(data.spending_limit),
+		periodLedgers: Number(data.period_ledgers),
+		spent: data.spending_history.map((e) => ({
+			amount: BigInt(e.amount),
+			ledger: Number(e.ledger_sequence),
+		})),
+	}
+}
+
+/**
+ * The first ledger, from `ledger` on, at which the cap lets `amount` through:
+ * `ledger` itself when it fits now, otherwise once enough of the window's
+ * spending ages out (an entry stops counting `periodLedgers` after its own
+ * ledger). `undefined` when `amount` is over the whole cap.
+ */
+export function capFreesAt(
+	window: CapWindow,
+	amount: bigint,
+	ledger: number,
+): number | undefined {
+	const counting = window.spent
+		.filter((e) => e.ledger > ledger - window.periodLedgers)
+		.sort((a, b) => a.ledger - b.ledger)
+	let total = counting.reduce((sum, e) => sum + e.amount, 0n)
+	if (total + amount <= window.limit) return ledger
+	for (const e of counting) {
+		total -= e.amount
+		if (total + amount <= window.limit) return e.ledger + window.periodLedgers
+	}
+	return undefined
 }
 
 const schemes = new Map<string, Promise<DigestScheme>>()
@@ -938,6 +1081,32 @@ const RELAYER: Record<string, string> = {
 
 const OVER_CAP =
 	"Your account refused: this would go over the spending cap you gave this app."
+
+/** A call the account would refuse for a spending cap (#3221), found before
+ * the passkey signed anything. `until` is when the cap lets it through again,
+ * in ms since the epoch; `undefined` when it never will (over the whole cap). */
+export class CapReachedError extends Error {
+	readonly until: number | undefined
+	constructor(until: number | undefined) {
+		super(OVER_CAP)
+		this.name = "CapReachedError"
+		this.until = until
+	}
+}
+
+/** When the caps of `grants` let a call through again, if the account
+ * refused one of them for its cap: remembered from that refusal, so a screen
+ * can say so instead of asking the device again. `undefined` when none is
+ * spent. */
+export function capReachedUntil(
+	account: string,
+	grants: Grant[],
+	now = Date.now(),
+): number | undefined {
+	const capped = loadSession(account)?.capped ?? {}
+	const until = Math.max(0, ...grants.map((g) => capped[g.label] ?? 0))
+	return until > now ? until : undefined
+}
 
 /** Whether the account refused a call because it would go over a grant's
  * spending cap (#3221). The account checks before anything is sent, so the
@@ -1090,6 +1259,8 @@ export async function submitWithSession<T>(
 		digestScheme(session.account, server, networkPassphrase),
 	])
 	const validUntil = latestLedger + AUTH_LIFETIME_LEDGERS
+	const labels = session.grants.map((g) => g.label)
+	const used = new Set<string>()
 	const auth: xdr.SorobanAuthorizationEntry[] = []
 	for (const recorded of op.auth ?? []) {
 		if (credentialAddress(recorded) !== session.account) {
@@ -1097,12 +1268,16 @@ export async function submitWithSession<T>(
 			continue
 		}
 		const entry = xdr.SorobanAuthorizationEntry.fromXDR(recorded.toXDR())
+		const contexts = authContexts(entry.rootInvocation())
 		const ruleIds = ruleIdsFor(
-			authContexts(entry.rootInvocation()),
+			contexts,
 			rules,
 			session.passkey,
 			latestLedger,
+			labels,
 		)
+		for (const id of ruleIds) used.add(rules.find((r) => r.id === id)!.name)
+		await checkCaps(session, contexts, ruleIds, rules, server, latestLedger)
 		const creds = entry.credentials().address()
 		creds.signatureExpirationLedger(validUntil)
 		const signaturePayload = hash(
@@ -1151,5 +1326,44 @@ export async function submitWithSession<T>(
 		throw new Error(`Transaction ${txHash} ${done.status.toLowerCase()}`)
 	if (!done.returnValue)
 		throw new Error(`Transaction ${txHash} has no return value`)
+	if (session.capped && [...used].some((label) => label in session.capped!)) {
+		for (const label of used) delete session.capped[label]
+		saveSession(session)
+	}
 	return { result: tx.options.parseResultXdr(done.returnValue), hash: txHash }
+}
+
+/**
+ * Refuse, before the passkey prompt, a call one of its rules' caps would
+ * refuse: add up the `transfer` amounts per capped rule and read that cap's
+ * spending window. Remembers the refusal and when the cap frees up (see
+ * `capReachedUntil`), and throws `CapReachedError`.
+ */
+async function checkCaps(
+	session: Session,
+	contexts: AuthContext[],
+	ruleIds: number[],
+	rules: InstalledRule[],
+	server: rpc.Server,
+	ledger: number,
+): Promise<void> {
+	const amounts = new Map<number, bigint>()
+	contexts.forEach((context, i) => {
+		const rule = rules.find((r) => r.id === ruleIds[i])
+		if (!rule?.cap || context.fn !== "transfer" || !context.args[2]) return
+		const amount = BigInt(scValToNative(context.args[2]) as bigint)
+		amounts.set(rule.id, (amounts.get(rule.id) ?? 0n) + amount)
+	})
+	for (const [id, amount] of amounts) {
+		const rule = rules.find((r) => r.id === id)!
+		const window = await readCapWindow(session.account, rule, server)
+		if (!window) continue
+		const at = capFreesAt(window, amount, ledger)
+		if (at === ledger) continue
+		const until =
+			at === undefined ? NEVER : Date.now() + (at - ledger) * LEDGER_MS
+		session.capped = { ...session.capped, [rule.name]: until }
+		saveSession(session)
+		throw new CapReachedError(at === undefined ? undefined : until)
+	}
 }

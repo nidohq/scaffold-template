@@ -19,6 +19,9 @@ import {
 	authContexts,
 	authDigest,
 	authPayload,
+	CapReachedError,
+	capFreesAt,
+	capReachedUntil,
 	checkSession,
 	createSessionPasskey,
 	derToCompact,
@@ -156,46 +159,93 @@ describe("asking Nido for grants", () => {
 })
 
 describe("session authorization", () => {
-	const rules: InstalledRule[] = [
-		{
-			id: 0,
-			name: "admin",
-			contract: account,
-			external: [{ verifier, key: "04".padEnd(130, "a") }],
-			delegated: [],
-			validUntil: undefined,
-		},
-		{
-			id: 3,
-			name: "app",
-			contract: app,
-			external: [{ verifier, key: keyData }],
-			delegated: [],
-			validUntil: 900,
-		},
-		{
-			id: 4,
-			name: "spend",
-			contract: sac,
-			external: [{ verifier, key: keyData }],
-			delegated: [],
-			validUntil: 900,
-		},
-	]
-	it("lists authorized contracts in the order __check_auth sees them", () => {
-		expect(
-			authContexts(call(app, [call(sac), call(app, [call(sac)])])),
-		).toEqual([app, sac, app, sac])
+	const rule = (
+		id: number,
+		name: string,
+		contract: string,
+		functions: string[] | undefined,
+		key = keyData,
+	): InstalledRule => ({
+		id,
+		name,
+		contract,
+		functions,
+		policies: [],
+		external: [{ verifier, key }],
+		delegated: [],
+		validUntil: 900,
 	})
-	it("selects the passkey's unexpired rule for each context", () => {
-		expect(ruleIdsFor([app, sac], rules, passkey, 900)).toEqual([3, 4])
-		expect(() => ruleIdsFor([sac], rules, passkey, 901)).toThrow(/expired/)
-		expect(() => ruleIdsFor([account], rules, passkey, 1)).toThrow(account)
+	const rules: InstalledRule[] = [
+		{ ...rule(0, "admin", account, undefined, "04".padEnd(130, "a")) },
+		rule(3, "app", app, ["f"]),
+		rule(4, "spend", sac, ["transfer"]),
+	]
+	const ctx = (contract: string, fn = "f") => ({ contract, fn, args: [] })
+	it("lists the calls in the order __check_auth sees them", () => {
+		const contexts = authContexts(
+			call(app, [call(sac), call(app, [call(sac)])]),
+		)
+		expect(contexts.map((c) => c.contract)).toEqual([app, sac, app, sac])
+		expect(contexts.every((c) => c.fn === "f")).toBe(true)
+	})
+	it("selects the passkey's unexpired rule for each call", () => {
+		expect(
+			ruleIdsFor([ctx(app), ctx(sac, "transfer")], rules, passkey, 900),
+		).toEqual([3, 4])
+		expect(() =>
+			ruleIdsFor([ctx(sac, "transfer")], rules, passkey, 901),
+		).toThrow(/expired/)
+		expect(() => ruleIdsFor([ctx(account)], rules, passkey, 1)).toThrow(account)
 		const other = { ...passkey, publicKey: "04".padEnd(130, "b") }
-		expect(() => ruleIdsFor([sac], rules, other, 1)).toThrow()
+		expect(() => ruleIdsFor([ctx(sac, "transfer")], rules, other, 1)).toThrow()
 		expect(passkeySigners([3, 4], rules, passkey)).toEqual([
 			{ verifier, key: keyData },
 		])
+	})
+	it("matches the function, and prefers this app's own rule over a decoy on the same token", () => {
+		// Decoys on the XLM contract, listed first: one allows only `approve`,
+		// one allows `transfer` but is no grant of this session (another gate's
+		// rule, or one left from an earlier approval, with its own cap)
+		const decoys = [
+			rule(7, "allowance", sac, ["approve"]),
+			rule(8, "old-spend", sac, ["transfer"]),
+		]
+		const all = [...decoys, ...rules]
+		const transfer = [ctx(sac, "transfer")]
+		expect(ruleIdsFor(transfer, all, passkey, 900, ["app", "spend"])).toEqual([
+			4,
+		])
+		// Without labels, the function still rules out `approve`
+		expect(ruleIdsFor(transfer, all, passkey, 900)).toEqual([8])
+		expect(() =>
+			ruleIdsFor([ctx(sac, "burn")], all, passkey, 900, ["spend"]),
+		).toThrow(/burn on/)
+		// A rule the document doesn't list allows any function
+		expect(
+			ruleIdsFor(
+				[ctx(app, "reset")],
+				[rule(9, "any", app, undefined)],
+				passkey,
+				900,
+			),
+		).toEqual([9])
+	})
+	it("finds when a cap lets an amount through again", () => {
+		const window = {
+			limit: 20_000_000n,
+			periodLedgers: 17_280,
+			spent: [
+				{ amount: 10_000_000n, ledger: 1_000 },
+				{ amount: 10_000_000n, ledger: 1_500 },
+			],
+		}
+		// Room for nothing more until the first spend ages out
+		expect(capFreesAt(window, 10_000_000n, 2_000)).toBe(1_000 + 17_280)
+		expect(capFreesAt(window, 20_000_000n, 2_000)).toBe(1_500 + 17_280)
+		expect(capFreesAt(window, 30_000_000n, 2_000)).toBeUndefined()
+		// An entry stops counting period_ledgers after its own ledger
+		expect(capFreesAt(window, 10_000_000n, 1_000 + 17_280)).toBe(1_000 + 17_280)
+		expect(capFreesAt({ ...window, spent: [] }, 20_000_000n, 5)).toBe(5)
 	})
 	it("encodes the AuthPayload byte for byte as Perch does", () => {
 		// perch testdata/auth/auth-vectors.json, auth_payload (external signer)
@@ -282,32 +332,49 @@ describe("session authorization", () => {
 			).toBe(true)
 		}
 	})
-	it("decodes installed_rules in either tuple-enum shape", () => {
+	it("decodes installed_rules in either tuple-enum shape, with the document's functions and cap", () => {
 		expect(
-			parseRules([
+			parseRules(
+				[
+					{
+						id: 1,
+						name: "probe",
+						context_type: ["CallContract", sac],
+						signers: [["External", verifier, Buffer.from(keyData, "hex")]],
+						policies: [{ policy: app }],
+						valid_until: 5342016,
+					},
+					{
+						id: 0,
+						name: "admin",
+						context_type: { CallContract: account },
+						signers: [
+							{ External: [verifier, new Uint8Array(65)] },
+							{ Delegated: sac },
+						],
+						valid_until: null,
+					},
+				],
 				{
-					id: 1,
-					name: "probe",
-					context_type: ["CallContract", sac],
-					signers: [["External", verifier, Buffer.from(keyData, "hex")]],
-					valid_until: 5342016,
-				},
-				{
-					id: 0,
-					name: "admin",
-					context_type: { CallContract: account },
-					signers: [
-						{ External: [verifier, new Uint8Array(65)] },
-						{ Delegated: sac },
+					rules: [
+						{
+							name: "probe",
+							functions: ["transfer"],
+							cap: { limit: "20000000", "period-ledgers": 17280 },
+							scope: { type: "contract", address: sac },
+						},
+						{ name: "admin", scope: { type: "self-admin" } },
 					],
-					valid_until: null,
 				},
-			]),
+			),
 		).toEqual([
 			{
 				id: 1,
 				name: "probe",
 				contract: sac,
+				functions: ["transfer"],
+				cap: { limit: 20_000_000n, periodLedgers: 17_280 },
+				policies: [app],
 				external: [{ verifier, key: keyData }],
 				delegated: [],
 				validUntil: 5342016,
@@ -316,6 +383,8 @@ describe("session authorization", () => {
 				id: 0,
 				name: "admin",
 				contract: account,
+				functions: undefined,
+				policies: [],
 				external: [{ verifier, key: "00".repeat(65) }],
 				delegated: [sac],
 				validUntil: undefined,
@@ -812,6 +881,221 @@ describe("a call signed by the app's passkey", () => {
 				signature: sig.signature!,
 			}),
 		).toEqual(signer!.val().bytes())
+	})
+	it("refuses over the cap before the device is asked, and remembers until when", async () => {
+		vi.stubGlobal("window", { location: { hostname: "localhost" } })
+		const { get } = authenticator()
+		const policy = StrKey.encodeContract(Buffer.alloc(32, 7))
+		const doc = JSON.stringify({
+			rules: [
+				{
+					name: "play",
+					functions: ["guess"],
+					scope: { type: "contract", address: app },
+				},
+				{
+					name: "spend",
+					functions: ["transfer"],
+					cap: { limit: "20000000", "period-ledgers": 17280 },
+					scope: { type: "contract", address: sac },
+				},
+			],
+		})
+		// Two 1 XLM guesses already in today's window
+		let spent = [
+			{ amount: 10_000_000n, ledger: 900 },
+			{ amount: 10_000_000n, ledger: 950 },
+		]
+		const window = () =>
+			nativeToScVal(
+				{
+					cached_total_spent: nativeToScVal(
+						spent.reduce((a, e) => a + e.amount, 0n),
+						{ type: "i128" },
+					),
+					period_ledgers: nativeToScVal(17_280, { type: "u32" }),
+					spending_history: xdr.ScVal.scvVec(
+						spent.map((e) =>
+							nativeToScVal(
+								{
+									amount: nativeToScVal(e.amount, { type: "i128" }),
+									ledger_sequence: nativeToScVal(e.ledger, { type: "u32" }),
+								},
+								{
+									type: {
+										amount: ["symbol", null],
+										ledger_sequence: ["symbol", null],
+									},
+								},
+							),
+						),
+					),
+					spending_limit: nativeToScVal(20_000_000n, { type: "i128" }),
+				},
+				{
+					type: {
+						cached_total_spent: ["symbol", null],
+						period_ledgers: ["symbol", null],
+						spending_history: ["symbol", null],
+						spending_limit: ["symbol", null],
+					},
+				},
+			)
+		const keys: xdr.LedgerKey[] = []
+		const { server, relayed } = network()
+		const reads = server.simulateTransaction as unknown as ReturnType<
+			typeof vi.fn
+		>
+		const original = reads.getMockImplementation() as (
+			...args: unknown[]
+		) => Promise<unknown>
+		reads.mockImplementation(
+			async (
+				tx: { operations: Operation.InvokeHostFunction[] },
+				l: unknown,
+				mode?: string,
+			) => {
+				const method = tx.operations[0]!.func.invokeContract()
+					.functionName()
+					.toString()
+				if (method === "document")
+					return simulated(
+						xdr.ScVal.scvVec([
+							nativeToScVal(1, { type: "u64" }),
+							nativeToScVal(Buffer.from(doc)),
+						]),
+					)
+				if (method === "installed_rules")
+					return simulated(
+						nativeToScVal(
+							[
+								{ id: 2, name: "play", target: app, policies: [] },
+								{ id: 3, name: "spend", target: sac, policies: [policy] },
+							].map(({ id, name, target, policies }) => ({
+								context_type: xdr.ScVal.scvVec([
+									xdr.ScVal.scvSymbol("CallContract"),
+									new Address(target).toScVal(),
+								]),
+								id: nativeToScVal(id, { type: "u32" }),
+								name,
+								policies: xdr.ScVal.scvVec(
+									policies.map((p) =>
+										nativeToScVal(
+											{ policy: new Address(p).toScVal() },
+											{ type: { policy: ["symbol", null] } },
+										),
+									),
+								),
+								signers: xdr.ScVal.scvVec([
+									xdr.ScVal.scvVec([
+										xdr.ScVal.scvSymbol("External"),
+										new Address(verifier).toScVal(),
+										nativeToScVal(Buffer.from(keyData, "hex")),
+									]),
+								]),
+								valid_until: nativeToScVal(1_720, { type: "u32" }),
+							})),
+							{ type: { id: ["symbol", null] } },
+						),
+					)
+				return original(tx, l, mode)
+			},
+		)
+		Object.assign(server, {
+			getLedgerEntries: vi.fn(async (...asked: xdr.LedgerKey[]) => {
+				keys.push(...asked)
+				return { entries: [{ val: { contractData: () => ({ val: window }) } }] }
+			}),
+		})
+		// A losing guess: `guess` on the game, then 1 XLM to the game
+		const me = new Address(account).toScVal()
+		const fn = (
+			contract: string,
+			name: string,
+			args: xdr.ScVal[],
+			subs: xdr.SorobanAuthorizedInvocation[] = [],
+		) =>
+			new xdr.SorobanAuthorizedInvocation({
+				function:
+					xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
+						new xdr.InvokeContractArgs({
+							contractAddress: new Address(contract).toScAddress(),
+							functionName: name,
+							args,
+						}),
+					),
+				subInvocations: subs,
+			})
+		const entry = new xdr.SorobanAuthorizationEntry({
+			credentials: recorded.credentials(),
+			rootInvocation: fn(
+				app,
+				"guess",
+				[nativeToScVal(3, { type: "u64" }), me],
+				[
+					fn(sac, "transfer", [
+						me,
+						new Address(app).toScVal(),
+						nativeToScVal(10_000_000n, { type: "i128" }),
+					]),
+				],
+			),
+		})
+		const guessing = {
+			...assembled,
+			built: new TransactionBuilder(
+				new Account(StrKey.encodeEd25519PublicKey(Buffer.alloc(32)), "0"),
+				{
+					fee: "100",
+					networkPassphrase: Networks.TESTNET,
+				},
+			)
+				.addOperation(Operation.invokeHostFunction({ func, auth: [entry] }))
+				.setTimeout(30)
+				.build(),
+		} as unknown as contract.AssembledTransaction<boolean>
+		store([
+			{ ...play, expiresAt: Date.now() + hour },
+			{ ...spend, expiresAt: Date.now() + hour },
+		])
+		const session = loadSession(account)!
+		const submit = () =>
+			submitWithSession(guessing, loadSession(account)!, {
+				server,
+				networkPassphrase: Networks.TESTNET,
+				relayer: "https://relay",
+			})
+
+		const refusal = await submit().catch((e: unknown) => e)
+		expect(refusal).toBeInstanceOf(CapReachedError)
+		expect(isOverCap(refusal)).toBe(true)
+		expect(get).not.toHaveBeenCalled()
+		expect(relayed).toHaveLength(0)
+		// The cap's own record, keyed by account and the XLM rule's id
+		const [key] = keys.map((k) => k.contractData())
+		expect(Address.fromScAddress(key!.contract()).toString()).toBe(policy)
+		expect(scValToNative(key!.key())).toEqual(["AccountContext", account, 3])
+		// Free again once the 900 spend is a day old: 17,180 ledgers from 1,000
+		const until = (refusal as CapReachedError).until!
+		expect(Math.round((until - Date.now()) / 60_000)).toBe(
+			Math.round((17_180 * 5) / 60),
+		)
+		expect(capReachedUntil(account, [play, spend])).toBe(until)
+		expect(capReachedUntil(account, [play])).toBeUndefined()
+
+		// A guess that fits clears it
+		spent = []
+		await submit()
+		expect(get).toHaveBeenCalledOnce()
+		expect(capReachedUntil(account, [spend])).toBeUndefined()
+		expect(session.passkey).toEqual(passkey)
+	})
+	it("forgets a spent cap once its grant is approved again", () => {
+		store([{ ...spend }], { capped: { spend: Date.now() + hour } })
+		localStorage.setItem(pending, account)
+		browser("http://localhost:5180/?delegation=ok")
+		expect(resumeSession()).toMatchObject({ outcome: "approved" })
+		expect(capReachedUntil(account, [spend])).toBeUndefined()
 	})
 	it("sends nothing when the account refuses, as over the cap", async () => {
 		vi.stubGlobal("window", { location: { hostname: "localhost" } })

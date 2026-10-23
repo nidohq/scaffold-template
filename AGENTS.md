@@ -130,7 +130,12 @@ export const MyAction = () => {
 - `describe(error, contractErrors)`: #3221 over the cap, #3002/#3016 no rule or
   expired, #3014 an uncovered contract in the tree, Nido relayer codes, and your
   contract's `Error(Contract, #n)`.
-- `isOverCap(error)`: the #3221 refusal, for a message that names your cap.
+- `isOverCap(error)`: the #3221 refusal, for a message that names your cap. A
+  call over a cap stops before the passkey prompt (`CapReachedError`, `until`);
+  `capReachedUntil(address, grants)` says until when, to keep a button off.
+- Rules are picked per call by contract and function (from the account's
+  `document()`), preferring this app's grant labels over other rules on the same
+  contract.
 - `isSmartAccount(address)` tells a C-address from a G-address.
 
 ## Smart accounts (C-addresses): what works

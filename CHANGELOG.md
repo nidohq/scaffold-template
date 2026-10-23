@@ -32,6 +32,23 @@
   guesses with one device prompt each (fees 0.565 and 0.035 XLM, paid by Nido's
   relayer), the third refused by the 2 XLM/day cap.
 
+### The right rule, and a spent cap said before the prompt
+
+- The app picks the rule for each call by contract and function, reading the
+  functions from the account's policy document (`document()`), and prefers a
+  rule this app asked for over another rule on the same contract for the same
+  passkey (another gate's, or one left from an earlier approval), which could
+  charge the wrong cap. `authContexts` returns `{ contract, fn, args }`.
+- Before the passkey prompt, the app reads a capped rule's spending record (the
+  `spending_limit` policy's storage) and refuses a call that would go over:
+  `CapReachedError` with `until`, the time the oldest spend ages out. The
+  refusal is remembered per grant; `capReachedUntil(address, grants)` returns it
+  until then. Guess the Number shows "Cap reached until ≈ …" and keeps Submit
+  off, across reloads, instead of asking the device for a guess the account
+  would refuse. Approving the grant again clears it.
+- The last guess's result sits inside the `SessionGate`, so the renew screen no
+  longer shows a stale refusal under it.
+
 ### A call says what it waits for
 
 - From Submit to the result, Guess the Number locks the input and the button (a

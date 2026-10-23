@@ -32,9 +32,9 @@ export default defineConfig(({ mode }) => ({
 	},
 	envPrefix: "PUBLIC_",
 	server: {
-		// One fixed port per app (PORT in the root .env): Nido session keys live
-		// in the origin's localStorage, so a server that drifted to another
-		// port would have none. Fail loudly instead.
+		// One fixed port per app (PORT in the root .env): Nido sessions live in
+		// the origin's localStorage, so a server that drifted to another port
+		// would have none. Fail loudly instead.
 		port:
 			Number(
 				loadEnv(mode, fileURLToPath(new URL("..", import.meta.url)), "").PORT,

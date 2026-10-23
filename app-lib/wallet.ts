@@ -12,6 +12,7 @@ import {
 } from "@nidohq/stellar-wallets-kit-module"
 import {
 	NIDO_BASE,
+	NIDO_RELAYER,
 	createNidoModules,
 	isSmartAccount,
 	smartAccountBalance,
@@ -19,10 +20,10 @@ import {
 	transactionSource,
 } from "./nido"
 import { allowHttp, networkPassphrase, rpcUrl, stellarNetwork } from "./env"
-import { getFriendbotUrl } from "./friendbot"
 import {
 	activeSession,
 	checkSession,
+	createSessionPasskey,
 	requestSession,
 	resumeSession,
 	submitWithSession,
@@ -30,22 +31,25 @@ import {
 } from "./session"
 
 /**
- * Ask the owner of a Nido account to let this app act within `grants`: one
- * passkey approval per grant, on Nido's own pages, then back to this page.
- * Call from a click handler; the page navigates away. Pass only the grants
- * still to approve (`sessionStatus(...).ask`); the app's key is reused.
+ * Make this app's own passkey for a Nido account: the device asks once. It is
+ * the key the session's rules name, so it signs every later call (one prompt
+ * each) and can do nothing those rules don't allow. Call from a click handler.
+ */
+export const createAppPasskey = (account: string) =>
+	createSessionPasskey(account, document.title || window.location.host)
+
+/**
+ * Ask the owner of a Nido account to let this app's passkey act within
+ * `grants`: Nido's page opens in a popup, and one confirmation with the
+ * owner's passkey installs every rule. Call from a click handler before any
+ * `await`; resolves with Nido's answer. Pass only the grants still to approve
+ * (`sessionStatus(...).ask`).
  */
 export const requestAppSession = (account: string, grants: Grant[]) =>
-	requestSession({
-		account,
-		grants,
-		base: nidoBase,
-		friendbotUrl: getFriendbotUrl,
-	})
+	requestSession({ account, grants, base: nidoBase })
 
-/** Record Nido's answer to a grant request; call once on page load. */
-export const resumeAppSession = () =>
-	resumeSession({ base: nidoBase, server, networkPassphrase })
+/** Record Nido's answer when it came back by redirect; call once on page load. */
+export const resumeAppSession = resumeSession
 
 /** Read the account's rules to see which pending grants actually landed. */
 export const checkAppSession = (account: string) =>
@@ -60,6 +64,11 @@ export const xlmTokenId = Asset.native().contractId(networkPassphrase)
 
 /** The Nido deployment this app connects to (`PUBLIC_NIDO_BASE`). */
 export const nidoBase: string = import.meta.env.PUBLIC_NIDO_BASE || NIDO_BASE
+
+/** The relayer that submits session calls and pays their fees
+ * (`PUBLIC_NIDO_RELAYER`). */
+export const nidoRelayer: string =
+	import.meta.env.PUBLIC_NIDO_RELAYER || NIDO_RELAYER
 
 StellarWalletsKit.init({
 	network: networkPassphrase as Networks,
@@ -105,8 +114,8 @@ export const signTransaction: typeof StellarWalletsKit.signTransaction = async (
  * gesture. Building a contract call simulates it over RPC first, which loses
  * the gesture, so the popup is blocked. Call this synchronously at the top of
  * the click/submit handler, before any `await`, and call the returned function
- * in a `finally`. A no-op for every other wallet, and when an approved
- * session key will sign instead.
+ * in a `finally`. A no-op for every other wallet, and when the app's session
+ * passkey will sign instead.
  */
 export function reserveSigningPopup(address: string | undefined): () => void {
 	if (
@@ -125,7 +134,8 @@ export function reserveSigningPopup(address: string | undefined): () => void {
  *
  * - G-address: the wallet signs, the SDK sends (`signAndSend`).
  * - C-address with an approved session (see `session.ts`): this app's
- *   session key signs under the account's rules, no prompt.
+ *   passkey signs under the account's rules (one device prompt), and Nido's
+ *   relayer submits.
  * - C-address without one: Nido's popup. Its passkey signs under the
  *   account's admin rule, which only covers calls on the account itself, so
  *   a call into another contract is refused; request a session for those.
@@ -141,7 +151,12 @@ export async function submitContract<T>(
 		return { result: sent.result, hash }
 	}
 	const session = activeSession(address)
-	if (session) return submitWithSession(tx, session, server, networkPassphrase)
+	if (session)
+		return submitWithSession(tx, session, {
+			server,
+			networkPassphrase,
+			relayer: nidoRelayer,
+		})
 	if (StellarWalletsKit.selectedModule.productId !== NIDO_ID) {
 		throw new Error("This smart-account submission flow requires Nido")
 	}

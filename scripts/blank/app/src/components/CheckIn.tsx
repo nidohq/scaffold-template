@@ -64,10 +64,10 @@ export const CheckIn = () => {
 				actionsOnly
 				explain={
 					<p>
-						Nido accounts approve this app once: its key may call{" "}
-						<code>check_in</code> on this contract for 24 hours. It moves no
-						money, so the rule has no spending cap, and Nido asks you to accept
-						that.
+						Nido accounts approve this app once: for 24 hours its own passkey
+						may call <code>check_in</code> on this contract, and your device
+						asks for it on each check-in. It moves no money, so the rule has no
+						spending cap.
 					</p>
 				}
 			>

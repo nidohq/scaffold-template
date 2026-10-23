@@ -54,24 +54,16 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
 	const [isPending, setIsPending] = useState(true)
 	const { addNotification } = useNotification()
 
-	// Coming back from a Nido session grant (`?delegation=…`)
+	// Coming back from a Nido session grant by redirect (`?delegation=…`),
+	// when the browser blocked its popup
 	useEffect(() => {
-		void resumeAppSession().then(
-			(resumed) => {
-				if (resumed?.outcome === "approved")
-					addNotification(
-						resumed.hash
-							? "Nido's relayer refused, so this app's key paid to apply the approval. Ready."
-							: "Nido approved this app's session",
-						"success",
-					)
-				if (resumed?.outcome === "cancelled")
-					addNotification("The session request was cancelled", "warning")
-				if (resumed?.outcome === "refused")
-					addNotification(resumed.message ?? "Nido refused", "error")
-			},
-			(error: unknown) => addNotification(String(error), "error"),
-		)
+		const resumed = resumeAppSession()
+		if (resumed?.outcome === "approved")
+			addNotification("Nido approved this app's passkey. Ready.", "success")
+		if (resumed?.outcome === "cancelled")
+			addNotification("The session request was cancelled", "warning")
+		if (resumed?.outcome === "refused")
+			addNotification(resumed.message ?? "Nido refused", "error")
 	}, [addNotification])
 
 	const updateBalances = useCallback(async () => {

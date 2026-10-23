@@ -270,7 +270,7 @@ check(
 		: `port ${port} is in use (your dev server, or another app)`,
 	free
 		? undefined
-		: "If it isn't this app: set another PORT in .env. Session keys are per origin, so approve again on the new port.",
+		: "If it isn't this app: set another PORT in .env. Sessions are per origin, so approve again on the new port.",
 )
 
 // --- Report --------------------------------------------------------------------

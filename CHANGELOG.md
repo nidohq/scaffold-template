@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### The session signer is a passkey
+
+- A session's signer is now a second passkey the device makes for the app, on
+  the app's own origin, in place of an ed25519 key in `localStorage`. The
+  browser keeps only its public key and credential id, so nothing there can
+  spend, and the owner's Nido passkey is never used for play. The rules name it
+  as an `External` signer, checked by the account's WebAuthn verifier.
+- One approval: `SessionGate` makes the passkey on first use, then opens Nido's
+  grant page in a popup with every grant the screen needs (`grant.<i>.*`,
+  `pubkey=`). The owner confirms once, and the popup posts the answer back. A
+  blocked popup falls back to the page going to Nido; `resumeAppSession` reads
+  the answer on return. Uncapped grants are sent as `limit=none`, and the XLM
+  cap arrives filled in, so the owner types nothing.
+- Each session call asks the device once: the passkey signs the account's auth
+  entry in the account's digest scheme (`addr_oz_v1`, or `oz_rule_ids` for older
+  accounts), the account checks it, the rules and the cap in a simulation, and
+  Nido's relayer submits it and pays the fee. An over-cap call is refused before
+  it is sent.
+- New in app-lib: `createAppPasskey`, `nidoRelayer` (`PUBLIC_NIDO_RELAYER`),
+  `authDigest`, `webAuthnSigData`. `requestAppSession` resolves with Nido's
+  answer; `resumeAppSession` is synchronous. `grantUrl` builds the account host
+  with the module's `accountOrigin`, so a Nido preview base
+  (`https://318.test.nido.fyi`) reaches `<account>--318.test.nido.fyi`.
+- Removed: Friendbot funding of a session key, CAP-0071 delegate signing, and
+  `delegation=signed` (there is no key in the browser to pay with). Sessions
+  stored by an earlier version are dropped and asked for again.
+- Verified on testnet against Nido's preview: one approval for both rules, two
+  guesses with one device prompt each (fees 0.565 and 0.035 XLM, paid by Nido's
+  relayer), the third refused by the 2 XLM/day cap.
+
 ### Guess the Number shows the spending cap
 
 - The sample's XLM grant caps spending at 2 XLM a day (was 3), so two wrong

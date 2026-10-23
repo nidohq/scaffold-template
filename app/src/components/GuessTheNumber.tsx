@@ -11,10 +11,11 @@ import { useWallet } from "../hooks/useWallet"
 import { SessionGate } from "./SessionGate"
 
 // A wrong guess calls `guess` and moves 1 XLM from the guesser, so a Nido
-// account approves one rule for each contract the call touches. The XLM rule
-// caps spending at 2 XLM a day: two wrong guesses go through without a prompt
-// and the account refuses the third. The cap's day matches the session's 24
-// hours, so it is also the most one approval can ever spend.
+// account approves one rule for each contract the call touches, both in one
+// confirmation. The XLM rule caps spending at 2 XLM a day: two wrong guesses
+// go through, one passkey prompt each, and the account refuses the third. The
+// cap's day matches the session's 24 hours, so it is also the most one
+// approval can ever spend.
 const dailyCap = 2
 const grants: Grant[] = [
 	{
@@ -87,12 +88,12 @@ export const GuessTheNumber = () => {
 				grants={grants}
 				explain={
 					<p>
-						Each wrong guess costs 1 XLM. Approve this game once and it can
-						guess for you for 24 hours without asking again, spending at most{" "}
-						{dailyCap} XLM a day from your account: {dailyCap} wrong guesses,
-						then your account says no. Nido asks you to confirm two rules: the
-						first allows only <code>guess</code>, without a cap; the second caps
-						the XLM.
+						Each wrong guess costs 1 XLM. Approve this game once and, for 24
+						hours, its own passkey can make guesses from your account: your
+						device asks for it on each guess, and it can spend at most{" "}
+						{dailyCap} XLM a day, so after {dailyCap} wrong guesses your account
+						says no. Nido shows you both rules, <code>guess</code> on the game
+						and the capped XLM, and you confirm them once.
 					</p>
 				}
 			>

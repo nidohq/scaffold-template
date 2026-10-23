@@ -18,6 +18,8 @@ export const source = StrKey.encodeEd25519PublicKey(Buffer.alloc(32, 2))
 export const hash = "ab".repeat(32)
 // The hosted wallet (app-lib NIDO_BASE) and its account subdomains.
 const nidoWallet = /https:\/\/([^/]+\.)?test\.nido\.fyi\//
+/** The WebAuthn verifier the mocked account names for passkey signers. */
+export const verifier = StrKey.encodeContract(Buffer.alloc(32, 9))
 const data = new SorobanDataBuilder().build().toXDR("base64")
 const envelope = new TransactionBuilder(new Account(source, "0"), {
 	fee: "100",
@@ -48,11 +50,15 @@ const result = new xdr.TransactionResult({
 	ext: new xdr.TransactionResultExt(0),
 }).toXDR("base64")
 
-/** What Nido's grant page does with the grant at `index`: the answer it
- * sends back (query or fragment, e.g. `?delegation=ok`) and whether the rule
- * landed on the account. */
+/** One grant of a request to Nido's grant page, with the request's passkey
+ * and duration. */
+export type AskedGrant = Record<string, string>
+
+/** What Nido's grant page does with the request at `index`: the answer it
+ * posts back (e.g. `?delegation=ok`) and whether its rules landed on the
+ * account. */
 export type GrantAnswer = (
-	grant: URLSearchParams,
+	grants: AskedGrant[],
 	index: number,
 ) => { answer: string; landed: boolean }
 
@@ -62,11 +68,12 @@ export const approveAll: GrantAnswer = () => ({
 })
 
 /**
- * Mock the testnet RPC, Friendbot and Nido's pages for `context`. `auth`
- * gives the auth entries a simulated call asks the account for (by function
- * name and contract), `grantAnswer` plays the owner on Nido's grant page, and
- * `refuse` plays the account: an error it returns fails the enforced
- * simulation of a session call (e.g. `Error(Contract, #3221)` over a cap).
+ * Mock the testnet RPC, Friendbot, Nido's pages and Nido's relayer for
+ * `context`. `auth` gives the auth entries a simulated call asks the account
+ * for (by function name and contract), `grantAnswer` plays the owner on
+ * Nido's grant page, and `refuse` plays the account: an error it returns
+ * fails the enforced simulation of a session call (e.g.
+ * `Error(Contract, #3221)` over a cap).
  */
 export async function mockServices(
 	context: BrowserContext,
@@ -83,9 +90,10 @@ export async function mockServices(
 	} = {},
 ) {
 	const calls: string[] = []
-	const grants: URLSearchParams[] = []
-	const landed: URLSearchParams[] = []
+	const requests: AskedGrant[][] = []
+	const landed: AskedGrant[] = []
 	const sent: xdr.TransactionEnvelope[] = []
+	const relayed: { func: string; auth: string[] }[] = []
 	const funded: string[] = []
 	await context.route(
 		"https://soroban-testnet.stellar.org/**",
@@ -117,7 +125,12 @@ export async function mockServices(
 						? nativeToScVal(125000000n, { type: "i128" })
 						: method === "installed_rules"
 							? installedRules(landed)
-							: nativeToScVal(false)
+							: method === "capabilities"
+								? nativeToScVal(
+										{ auth_digest: "addr_oz_v1" },
+										{ type: { auth_digest: ["symbol", "symbol"] } },
+									)
+								: nativeToScVal(false)
 				response = refusal
 					? { latestLedger: 100, error: refusal }
 					: {
@@ -145,7 +158,7 @@ export async function mockServices(
 					resultMetaXdr: meta,
 				}
 			} else if (body.method === "getLedgerEntries") {
-				// Only the session key's account is ever read this way.
+				// Only classic accounts are read this way.
 				const keys = (body.params as unknown as { keys: string[] }).keys
 				response = { latestLedger: 100, entries: keys.map(accountEntry) }
 			} else if (body.method === "sendTransaction") {
@@ -154,13 +167,6 @@ export async function mockServices(
 					"base64",
 				)
 				sent.push(tx)
-				// A submitted `apply_doc` installs the grant it carries.
-				const fn = tx.v1().tx().operations()[0]!.body().invokeHostFunctionOp()
-				if (
-					fn.hostFunction().invokeContract().functionName().toString() ===
-					"apply_doc"
-				)
-					landed.push(grants.at(-1)!)
 				response = { status: "PENDING", hash, latestLedger: 100 }
 			} else throw new Error(`Unexpected RPC method: ${body.method}`)
 			await route.fulfill({
@@ -172,20 +178,42 @@ export async function mockServices(
 		funded.push(new URL(route.request().url()).searchParams.get("addr")!)
 		return route.fulfill({ json: { successful: true } })
 	})
+	// Nido's relayer: submits a signed call and pays its fee.
+	await context.route("https://nido.fly.dev/relay", async (route) => {
+		const { params } = route.request().postDataJSON() as {
+			params: { func: string; auth: string[] }
+		}
+		relayed.push(params)
+		await route.fulfill({
+			json: {
+				success: true,
+				data: { transactionId: "t1", hash, status: "confirmed" },
+			},
+		})
+	})
 	await context.route(nidoWallet, async (route) => {
 		const url = new URL(route.request().url())
 		if (url.pathname === "/security/delegate-doc/") {
-			// The owner approves (or not) on Nido's page; it sends them back.
-			grants.push(url.searchParams)
-			const outcome = grantAnswer(url.searchParams, grants.length - 1)
-			if (outcome.landed) landed.push(url.searchParams)
-			const back = new URL(url.searchParams.get("return")!)
-			const [query, fragment] = outcome.answer.split("#")
-			back.search = query ?? ""
-			if (fragment) back.hash = fragment
+			// The owner approves (or not) every grant at once on Nido's page,
+			// which posts the answer to the app that opened it and closes.
+			const q = url.searchParams
+			const asked: AskedGrant[] = []
+			for (let i = 0; q.has(`grant.${i}.label`); i++)
+				asked.push({
+					pubkey: q.get("pubkey")!,
+					duration: q.get("duration")!,
+					...Object.fromEntries(
+						[...q]
+							.filter(([k]) => k.startsWith(`grant.${i}.`))
+							.map(([k, v]) => [k.slice(`grant.${i}.`.length), v]),
+					),
+				})
+			requests.push(asked)
+			const outcome = grantAnswer(asked, requests.length - 1)
+			if (outcome.landed) landed.push(...asked)
 			return route.fulfill({
-				status: 302,
-				headers: { location: back.toString() },
+				contentType: "text/html",
+				body: `<!doctype html><title>Nido test grant</title><script>opener.postMessage({source:'nido-wallet',search:${JSON.stringify(outcome.answer)}}, ${JSON.stringify(q.get("origin"))}); window.close()</script>`,
 			})
 		}
 		const search =
@@ -195,25 +223,26 @@ export async function mockServices(
 			body: `<!doctype html><title>Nido test ceremony</title><h1>Test wallet fixture</h1><button id="approve">Approve test request</button><script>document.querySelector('#approve').onclick = () => { opener.postMessage({source:'nido-wallet',search:${JSON.stringify(search)}}, ${JSON.stringify(url.searchParams.get("dapp"))}); window.close(); }</script>`,
 		})
 	})
-	return { calls, grants, landed, sent, funded }
+	return { calls, requests, landed, sent, relayed, funded }
 }
 
 /** What the account reports after `grants` landed, as rules 2, 3, … */
-function installedRules(grants: URLSearchParams[]) {
+function installedRules(grants: AskedGrant[]) {
 	return xdr.ScVal.scvVec(
 		grants.map((grant, i) =>
 			nativeToScVal(
 				{
 					context_type: xdr.ScVal.scvVec([
 						xdr.ScVal.scvSymbol("CallContract"),
-						new Address(grant.get("target")!).toScVal(),
+						new Address(grant.target!).toScVal(),
 					]),
 					id: nativeToScVal(i + 2, { type: "u32" }),
-					name: grant.get("label")!,
+					name: grant.label!,
 					signers: xdr.ScVal.scvVec([
 						xdr.ScVal.scvVec([
-							xdr.ScVal.scvSymbol("Delegated"),
-							new Address(grant.get("signer")!).toScVal(),
+							xdr.ScVal.scvSymbol("External"),
+							new Address(verifier).toScVal(),
+							nativeToScVal(Buffer.from(grant.pubkey!, "hex")),
 						]),
 					]),
 					valid_until: nativeToScVal(1000, { type: "u32" }),
@@ -277,6 +306,31 @@ function accountEntry(key: string) {
 		}),
 	)
 	return { key, xdr: entry.toXDR("base64"), lastModifiedLedgerSeq: 1 }
+}
+
+/**
+ * Give `page` a virtual authenticator, as a device with a platform passkey:
+ * every prompt is answered at once, with user verification. Returns a count
+ * of the credentials it holds.
+ */
+export async function virtualAuthenticator(page: Page) {
+	const cdp = await page.context().newCDPSession(page)
+	await cdp.send("WebAuthn.enable")
+	const { authenticatorId } = await cdp.send(
+		"WebAuthn.addVirtualAuthenticator",
+		{
+			options: {
+				protocol: "ctap2",
+				transport: "internal",
+				hasResidentKey: true,
+				hasUserVerification: true,
+				isUserVerified: true,
+				automaticPresenceSimulation: true,
+			},
+		},
+	)
+	return async () =>
+		(await cdp.send("WebAuthn.getCredentials", { authenticatorId })).credentials
 }
 
 /** Connect the mocked Nido account through the real wallet picker. */

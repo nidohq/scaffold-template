@@ -7,8 +7,8 @@ stellar scaffold init --template nidohq/scaffold-template my-app
 A React app template for Stellar smart contracts where people sign in with a
 passkey. [Nido](https://test.nido.fyi) smart accounts sit in the wallet picker
 next to the usual wallets, and the template carries what a smart account needs
-to use your contracts: session keys the owner approves once, the calls signed
-with them, and the screens that ask. Built on
+to use your contracts: a second passkey, made by the app, that the owner allows
+once to make a few calls, the calls it signs, and the screens that ask. Built on
 [Scaffold Stellar](https://github.com/stellar-scaffold/cli). Testnet only.
 
 You need Node 22.12+, Rust with the `wasm32v1-none` target and the
@@ -21,8 +21,9 @@ npm run clients:testnet && npm run dev
 ```
 
 `npm run doctor` says what is missing and how to fix it. Open the app, connect
-with Nido and approve the sample once: Guess the Number then plays without
-prompts, at 1 XLM a wrong guess, until the 2 XLM a day you allowed runs out.
+with Nido and approve the sample once: Guess the Number then plays with one
+device passkey prompt per guess and no Nido page, at 1 XLM a wrong guess, until
+the 2 XLM a day you allowed runs out.
 
 - **Building an app?** Read [`NIDO.md`](NIDO.md): the quick start, your own
   contract in five steps, the call pattern, the rules a Nido account follows,

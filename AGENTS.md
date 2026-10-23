@@ -118,7 +118,10 @@ export const MyAction = () => {
   be a transaction source) + `submitContract` + release. It always resolves
   `{ result, hash }`: G-address via the wallet, C-address via the app's session
   passkey (one device prompt, submitted by Nido's relayer), otherwise Nido's
-  popup.
+  popup. Its third argument `{ onStage }` reports `preparing`,
+  `passkey`/`wallet`, `sending`, `confirming`; show them with `Pending` and
+  `stageText` (`app/src/components/Pending.tsx`), cleared in a `finally`. Use
+  `onSubmit`, not a form `action` (React defers an action's state updates).
 - `SessionGate` compares `grants` with what the account approved
   (`sessionStatus`/`sessionCovers`: target, functions, cap, expiry) and shows
   make-passkey / ask / renew / waiting states; `actionsOnly` keeps children

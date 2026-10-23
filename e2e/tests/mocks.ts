@@ -82,11 +82,14 @@ export async function mockServices(
 		grantAnswer = approveAll,
 		auth = () => [],
 		refuse = () => undefined,
+		relayDelay = 0,
 	}: {
 		signResult?: string
 		grantAnswer?: GrantAnswer
 		auth?: (method: string, target: string) => xdr.SorobanAuthorizationEntry[]
 		refuse?: () => string | undefined
+		/** How long Nido's relayer takes to answer, in ms. */
+		relayDelay?: number
 	} = {},
 ) {
 	const calls: string[] = []
@@ -184,6 +187,7 @@ export async function mockServices(
 			params: { func: string; auth: string[] }
 		}
 		relayed.push(params)
+		await new Promise((resolve) => setTimeout(resolve, relayDelay))
 		await route.fulfill({
 			json: {
 				success: true,
@@ -332,6 +336,27 @@ export async function virtualAuthenticator(page: Page) {
 	return async () =>
 		(await cdp.send("WebAuthn.getCredentials", { authenticatorId })).credentials
 }
+
+/** Record, in order, every text the page announces in a `role=status`
+ * element, so a test can check what a person saw while they waited. */
+export const recordStatuses = (page: Page) =>
+	page.addInitScript(() => {
+		const seen: string[] = []
+		;(window as unknown as { statuses: string[] }).statuses = seen
+		new MutationObserver(() => {
+			for (const el of document.querySelectorAll('[role="status"]')) {
+				const text = el.textContent?.trim()
+				if (text && seen.at(-1) !== text) seen.push(text)
+			}
+		}).observe(document, {
+			subtree: true,
+			childList: true,
+			characterData: true,
+		})
+	})
+
+export const statuses = (page: Page) =>
+	page.evaluate(() => (window as unknown as { statuses: string[] }).statuses)
 
 /** Connect the mocked Nido account through the real wallet picker. */
 export async function connect(page: Page) {

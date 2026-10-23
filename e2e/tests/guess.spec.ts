@@ -14,6 +14,8 @@ import {
 	connect,
 	invocation,
 	mockServices,
+	recordStatuses,
+	statuses,
 	verifier,
 	virtualAuthenticator,
 	type GrantAnswer,
@@ -93,9 +95,11 @@ test("a Nido account approves the game's passkey once, then each guess asks only
 }) => {
 	const { requests, relayed, sent } = await mockServices(context, {
 		auth: guessAuth,
+		relayDelay: 800,
 	})
 	const credentials = await virtualAuthenticator(page)
 	await countPrompts(page)
+	await recordStatuses(page)
 	await connect(page)
 	await expect(
 		page.getByPlaceholder("Guess a number from 1 to 10!"),
@@ -144,7 +148,29 @@ test("a Nido account approves the game's passkey once, then each guess asks only
 
 	let popups = 0
 	page.on("popup", () => popups++)
-	await guess(page, 3)
+	// From Submit to the result, the player sees what the guess waits for,
+	// and can't change or resubmit it
+	const input = page.getByPlaceholder("Guess a number from 1 to 10!")
+	await input.fill("3")
+	await page.getByRole("button", { name: "Submit", exact: true }).click()
+	await expect(page.getByRole("button", { name: "Guessing…" })).toBeDisabled()
+	await expect(input).toHaveAttribute("readonly")
+	await expect(page.getByRole("status").last()).toHaveText(
+		/Sending…|Confirming on Stellar…/,
+	)
+	await expect(page.locator(".guess-result")).toContainText("You got it!")
+	await expect(page.getByRole("button", { name: "Submit" })).toBeEnabled()
+	await expect(input).not.toHaveAttribute("readonly")
+	const seen = await statuses(page)
+	const order = [
+		"Waiting for your passkey: your device makes one for this app…",
+		"Waiting for Nido: approve in its window, which closes once the rules are on Stellar…",
+		"Preparing…",
+		"Waiting for your passkey…",
+		"Sending…",
+		"Confirming on Stellar…",
+	]
+	expect(seen.filter((s) => order.includes(s))).toEqual(order)
 	expect(await prompts(page)).toBe(1)
 	expect(popups).toBe(0)
 	await expect(page.getByText(/^Transaction [0-9a-f]{64}$/)).toBeVisible()
@@ -224,6 +250,9 @@ test("over the 2 XLM cap, the account refuses, nothing is sent, and the player i
 	await guess(page, 7, "the 2 XLM a day you let this game spend")
 	await expect(page.getByRole("alert")).toContainText("It cost nothing")
 	expect(relayed).toHaveLength(2)
+	// The refusal ends the wait: nothing still says it is under way
+	await expect(page.getByRole("button", { name: "Submit" })).toBeEnabled()
+	await expect(page.locator(".guess-the-number .pending")).toHaveCount(0)
 })
 
 test("a cancelled approval keeps the game's passkey for the next try", async ({

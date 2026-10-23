@@ -11,6 +11,7 @@ import {
 	rpc,
 	scValToNative,
 } from "@stellar/stellar-sdk"
+import { type SubmitStage } from "./session"
 
 export const isSmartAccount = StrKey.isValidContract
 
@@ -74,11 +75,14 @@ export async function submitSmartAccount<T>(
 		opts: { address: string; networkPassphrase: string },
 	) => Promise<WalletSignResult>,
 	server: rpc.Server,
+	onStage?: (stage: SubmitStage) => void,
 ): Promise<{ result: T; hash: string }> {
+	onStage?.("wallet")
 	const response = await sign(tx.toXDR(), {
 		address,
 		networkPassphrase: tx.options.networkPassphrase,
 	})
+	onStage?.("confirming")
 	if (!response.submitted) {
 		throw new Error(
 			"This Nido deployment returned signed XDR without submitting. Use a Nido deployment with relayer support.",

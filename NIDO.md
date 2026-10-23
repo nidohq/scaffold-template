@@ -157,6 +157,13 @@ Everything here comes from `@stellar-scaffold/app-lib` (the template's
   (one device prompt) and submitted by Nido's relayer for a Nido account with a
   session, otherwise through Nido's popup. The parts are exported too, for your
   own flow: `reserveSigningPopup`, `transactionSource`, `submitContract`.
+- A call takes several seconds, so say what it waits for: pass
+  `{ onStage: setStage }` as `submitCall`'s third argument and render
+  `<Pending>{stageText[stage]}</Pending>` (`app/src/components/Pending.tsx`)
+  while `stage` is set: "Preparing…", "Waiting for your passkey…" (or "…your
+  wallet…"), "Sending…", "Confirming on Stellar…", announced to screen readers.
+  Clear it in a `finally`, and lock the inputs meanwhile. Use a submit handler,
+  not a form `action`: React holds an action's state updates until it ends.
 - `SessionGate` shows its children to classic wallets, and to a Nido account
   once its approvals cover `grants`. Until then it explains what will be asked,
   has the device make the app's passkey on first use, and opens Nido's page in a

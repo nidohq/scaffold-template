@@ -4,10 +4,12 @@ import {
 	submitCall,
 	xlmTokenId,
 	type Grant,
+	type SubmitStage,
 } from "@stellar-scaffold/app-lib"
 import { guessTheNumber } from "@stellar-scaffold/app-lib/clients"
-import { useState } from "react"
+import { useState, type FormEvent } from "react"
 import { useWallet } from "../hooks/useWallet"
+import { Pending, stageText } from "./Pending"
 import { SessionGate } from "./SessionGate"
 
 // A wrong guess calls `guess` and moves 1 XLM from the guesser, so a Nido
@@ -37,25 +39,32 @@ export const GuessTheNumber = () => {
 	const { address, updateBalances } = useWallet()
 	const [error, setError] = useState<string>()
 	const [hash, setHash] = useState<string>()
-	const [result, setResult] = useState<
-		"idle" | "loading" | "success" | "failure"
-	>("idle")
+	const [result, setResult] = useState<"idle" | "success" | "failure">("idle")
+	// What a guess under way waits for; undefined when none is
+	const [stage, setStage] = useState<SubmitStage>()
 
-	const submitGuess = async (formData: FormData) => {
-		const guess = formData.get("guess")
+	// A submit handler, not a form action: React holds a form action's state
+	// updates until it ends, so the progress below would never show.
+	const submitGuess = async (event: FormEvent<HTMLFormElement>) => {
+		event.preventDefault()
+		const guess = new FormData(event.currentTarget).get("guess")
 		if (!address || typeof guess != "string" || !guess) {
 			setResult("failure")
 			return
 		}
-		setResult("loading")
+		setResult("idle")
 		setError(undefined)
+		setHash(undefined)
 		try {
 			// No await before submitCall: Nido's popup needs the click's gesture
-			const { result, hash } = await submitCall(address, (publicKey) =>
-				guessTheNumber.guess(
-					{ a_number: BigInt(guess), guesser: address },
-					{ publicKey },
-				),
+			const { result, hash } = await submitCall(
+				address,
+				(publicKey) =>
+					guessTheNumber.guess(
+						{ a_number: BigInt(guess), guesser: address },
+						{ publicKey },
+					),
+				{ onStage: setStage },
 			)
 			setHash(hash)
 			if (result.isErr()) {
@@ -73,6 +82,8 @@ export const GuessTheNumber = () => {
 					: describe(e),
 			)
 			setResult("failure")
+		} finally {
+			setStage(undefined)
 		}
 	}
 
@@ -97,7 +108,7 @@ export const GuessTheNumber = () => {
 					</p>
 				}
 			>
-				<form action={submitGuess}>
+				<form onSubmit={(event) => void submitGuess(event)} aria-busy={!!stage}>
 					<input
 						placeholder="Guess a number from 1 to 10!"
 						id="guess"
@@ -106,11 +117,20 @@ export const GuessTheNumber = () => {
 						min="1"
 						max="10"
 						onChange={reset}
+						readOnly={!!stage}
 					/>
-					<button type="submit" disabled={result === "loading"}>
-						Submit
+					<button type="submit" disabled={!!stage}>
+						{stage ? (
+							<>
+								<span className="spinner" aria-hidden="true" />
+								Guessing…
+							</>
+						) : (
+							"Submit"
+						)}
 					</button>
 				</form>
+				{stage && <Pending>{stageText[stage]}</Pending>}
 			</SessionGate>
 
 			{result === "success" && (
@@ -132,7 +152,7 @@ export const GuessTheNumber = () => {
 					)}
 				</div>
 			)}
-			{hash && result !== "loading" && (
+			{hash && !stage && (
 				<p className="session-note">
 					Transaction <code>{hash}</code>
 				</p>

@@ -11,6 +11,7 @@ import { useState, type ReactNode } from "react"
 import { useNotification } from "../hooks/useNotification"
 import { useSessionStatus } from "../hooks/useSessionStatus"
 import { useWallet } from "../hooks/useWallet"
+import { Pending } from "./Pending"
 
 const rules = (n: number) => `${n} ${n === 1 ? "rule" : "rules"}`
 
@@ -60,7 +61,7 @@ export const SessionGate = ({
 			)
 	}
 	const makePasskey = async () => {
-		setBusy("Follow your device's prompt to make a passkey for this app…")
+		setBusy("Waiting for your passkey: your device makes one for this app…")
 		try {
 			await createAppPasskey(address)
 			setBusy(undefined)
@@ -72,14 +73,16 @@ export const SessionGate = ({
 	const ask = (toAsk: Grant[]) => {
 		try {
 			const answer = requestAppSession(address, toAsk)
-			setBusy("Approve in the Nido window…")
+			setBusy(
+				"Waiting for Nido: approve in its window, which closes once the rules are on Stellar…",
+			)
 			void answer.then(answered, fail)
 		} catch (error) {
 			fail(error)
 		}
 	}
 	const check = async () => {
-		setBusy("Checking your account on chain…")
+		setBusy("Checking your account on Stellar…")
 		try {
 			const { waiting } = await checkAppSession(address)
 			setBusy(undefined)
@@ -155,7 +158,7 @@ export const SessionGate = ({
 	return (
 		<>
 			<div className="card session-gate" aria-busy={Boolean(busy)}>
-				{busy ? <p role="status">{busy}</p> : card}
+				{busy ? <Pending>{busy}</Pending> : card}
 			</div>
 			{actionsOnly && (
 				<fieldset className="session-gated" disabled>

@@ -986,6 +986,16 @@ export function describe(
 
 // --- Submission --------------------------------------------------------------
 
+/** Where a submission is, for a screen to say what it waits for: building and
+ * simulating the call, the device's passkey prompt, the wallet's approval,
+ * handing the signed call to the network, or the network's verdict. */
+export type SubmitStage =
+	| "preparing"
+	| "passkey"
+	| "wallet"
+	| "sending"
+	| "confirming"
+
 type RelayerAnswer = {
 	transactionId: string | null
 	hash: string | null
@@ -1031,12 +1041,14 @@ async function relay(
 	relayer: string,
 	func: xdr.HostFunction,
 	auth: xdr.SorobanAuthorizationEntry[],
+	onStage?: (stage: SubmitStage) => void,
 ): Promise<string> {
 	const sent = await relayerCall(relayer, {
 		func: func.toXDR("base64"),
 		auth: auth.map((a) => a.toXDR("base64")),
 		skipWait: true,
 	})
+	onStage?.("confirming")
 	let last = sent
 	// The relayer's transaction is valid for about a minute; wait past it.
 	for (let attempt = 0; attempt < 55; attempt++) {
@@ -1060,11 +1072,13 @@ async function relay(
  * rules (the device asks once), hand it to Nido's relayer, and return the
  * confirmed result. The account checks the signature, the rules and any cap
  * in a simulation first, so a refused call is never sent and costs nothing.
+ * `onStage` hears `passkey`, `sending` and `confirming` as they start.
  */
 export async function submitWithSession<T>(
 	tx: contract.AssembledTransaction<T>,
 	session: Session,
 	network: { server: rpc.Server; networkPassphrase: string; relayer: string },
+	onStage?: (stage: SubmitStage) => void,
 ): Promise<{ result: T; hash: string }> {
 	const { server, networkPassphrase, relayer } = network
 	if (!tx.built) throw new Error("Simulate the call before submitting it")
@@ -1101,6 +1115,7 @@ export async function submitWithSession<T>(
 				}),
 			).toXDR(),
 		)
+		onStage?.("passkey")
 		const assertion = await signWithPasskey(
 			session.passkey,
 			await authDigest(session.account, signaturePayload, ruleIds, scheme),
@@ -1115,6 +1130,7 @@ export async function submitWithSession<T>(
 		auth.push(entry)
 	}
 
+	onStage?.("sending")
 	const signed = new TransactionBuilder(new Account(SIMULATION_SOURCE, "0"), {
 		fee: "100",
 		networkPassphrase,
@@ -1129,7 +1145,7 @@ export async function submitWithSession<T>(
 	)
 	if (!rpc.Api.isSimulationSuccess(enforced))
 		throw new Error(explainRefusal(enforced.error))
-	const txHash = await relay(relayer, op.func, auth)
+	const txHash = await relay(relayer, op.func, auth, onStage)
 	const done = await server.pollTransaction(txHash, { attempts: 30 })
 	if (done.status !== rpc.Api.GetTransactionStatus.SUCCESS)
 		throw new Error(`Transaction ${txHash} ${done.status.toLowerCase()}`)

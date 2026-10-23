@@ -1,7 +1,13 @@
-import { describe, submitCall, type Grant } from "@stellar-scaffold/app-lib"
+import {
+	describe,
+	submitCall,
+	type Grant,
+	type SubmitStage,
+} from "@stellar-scaffold/app-lib"
 import { checkIn } from "@stellar-scaffold/app-lib/clients"
 import { useEffect, useState } from "react"
 import { useWallet } from "../hooks/useWallet"
+import { Pending, stageText } from "./Pending"
 import { SessionGate } from "./SessionGate"
 
 // `check_in` touches only this contract and moves no money, so a Nido account
@@ -19,7 +25,8 @@ export const CheckIn = () => {
 	const { address } = useWallet()
 	const [count, setCount] = useState<number>()
 	const [message, setMessage] = useState<string>()
-	const [busy, setBusy] = useState(false)
+	// What a check-in under way waits for; undefined when none is
+	const [stage, setStage] = useState<SubmitStage>()
 
 	// Reads simulate and need no signature
 	useEffect(() => {
@@ -33,19 +40,20 @@ export const CheckIn = () => {
 
 	const onCheckIn = async () => {
 		if (!address) return
-		setBusy(true)
 		setMessage(undefined)
 		try {
 			// No await before submitCall: Nido's popup needs the click's gesture
-			const { result, hash } = await submitCall(address, (publicKey) =>
-				checkIn.check_in({ who: address }, { publicKey }),
+			const { result, hash } = await submitCall(
+				address,
+				(publicKey) => checkIn.check_in({ who: address }, { publicKey }),
+				{ onStage: setStage },
 			)
 			setCount(result)
 			setMessage(`Checked in. Transaction ${hash}`)
 		} catch (error) {
 			setMessage(describe(error))
 		} finally {
-			setBusy(false)
+			setStage(undefined)
 		}
 	}
 
@@ -73,13 +81,17 @@ export const CheckIn = () => {
 			>
 				<button
 					type="button"
-					disabled={!address || busy}
+					disabled={!address || !!stage}
 					onClick={() => void onCheckIn()}
 				>
 					Check in
 				</button>
 			</SessionGate>
-			{message && <p role="status">{message}</p>}
+			{stage ? (
+				<Pending>{stageText[stage]}</Pending>
+			) : (
+				message && <p role="status">{message}</p>
+			)}
 		</div>
 	)
 }

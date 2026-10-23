@@ -28,6 +28,7 @@ import {
 	resumeSession,
 	submitWithSession,
 	type Grant,
+	type SubmitStage,
 } from "./session"
 
 /**
@@ -128,6 +129,14 @@ export function reserveSigningPopup(address: string | undefined): () => void {
 	return reserveCeremonyPopup()
 }
 
+/** Options for `submitCall` and `submitContract`. */
+export interface SubmitOptions {
+	/** Hears each stage as it starts, so a screen can say what it waits for:
+	 * `preparing`, then `passkey` (the app's session passkey) or `wallet`,
+	 * then `sending` and `confirming`. */
+	onStage?: (stage: SubmitStage) => void
+}
+
 /**
  * Submit a generated-client call for the connected account and resolve with
  * the confirmed result and its transaction hash.
@@ -143,8 +152,10 @@ export function reserveSigningPopup(address: string | undefined): () => void {
 export async function submitContract<T>(
 	tx: contract.AssembledTransaction<T>,
 	address: string,
+	{ onStage }: SubmitOptions = {},
 ): Promise<{ result: T; hash: string }> {
 	if (!isSmartAccount(address)) {
+		onStage?.("wallet")
 		const sent = await tx.signAndSend({ signTransaction })
 		const hash = sent.sendTransactionResponse?.hash
 		if (!hash) throw new Error("The wallet sent no transaction")
@@ -152,15 +163,16 @@ export async function submitContract<T>(
 	}
 	const session = activeSession(address)
 	if (session)
-		return submitWithSession(tx, session, {
-			server,
-			networkPassphrase,
-			relayer: nidoRelayer,
-		})
+		return submitWithSession(
+			tx,
+			session,
+			{ server, networkPassphrase, relayer: nidoRelayer },
+			onStage,
+		)
 	if (StellarWalletsKit.selectedModule.productId !== NIDO_ID) {
 		throw new Error("This smart-account submission flow requires Nido")
 	}
-	return submitSmartAccount(tx, address, signTransaction, server)
+	return submitSmartAccount(tx, address, signTransaction, server, onStage)
 }
 
 /**
@@ -171,18 +183,23 @@ export async function submitContract<T>(
  *
  *     const { result, hash } = await submitCall(address, (publicKey) =>
  *         myContract.my_fn({ user: address }, { publicKey }))
+ *
+ * Pass `{ onStage }` to show what the call is waiting for.
  */
 export async function submitCall<T>(
 	address: string,
 	build: (
 		publicKey: string | undefined,
 	) => Promise<contract.AssembledTransaction<T>>,
+	options: SubmitOptions = {},
 ): Promise<{ result: T; hash: string }> {
 	const release = reserveSigningPopup(address)
 	try {
+		options.onStage?.("preparing")
 		return await submitContract(
 			await build(transactionSource(address)),
 			address,
+			options,
 		)
 	} finally {
 		release()

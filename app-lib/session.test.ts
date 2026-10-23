@@ -740,12 +740,16 @@ describe("a call signed by the app's passkey", () => {
 		vi.stubGlobal("window", { location: { hostname: "localhost" } })
 		const { get, challenges } = authenticator()
 		const { server, modes, relayed } = network()
+		const stages: string[] = []
 		const result = await submitWithSession(
 			assembled,
 			{ account, passkey, grants: [] },
 			{ server, networkPassphrase: Networks.TESTNET, relayer: "https://relay" },
+			(stage) => stages.push(stage),
 		)
 		expect(result).toEqual({ result: false, hash: txHash })
+		// What a screen can say while it waits, in order
+		expect(stages).toEqual(["passkey", "sending", "confirming"])
 		expect(get).toHaveBeenCalledOnce()
 		expect(modes).toContain("enforce")
 		expect(relayed).toHaveLength(1)
@@ -813,13 +817,16 @@ describe("a call signed by the app's passkey", () => {
 		vi.stubGlobal("window", { location: { hostname: "localhost" } })
 		authenticator()
 		const { server, relayed } = network("HostError: Error(Contract, #3221)")
+		const stages: string[] = []
 		const refused = submitWithSession(
 			assembled,
 			{ account, passkey, grants: [] },
 			{ server, networkPassphrase: Networks.TESTNET, relayer: "https://relay" },
+			(stage) => stages.push(stage),
 		)
 		await expect(refused).rejects.toSatisfy(isOverCap)
 		expect(relayed).toHaveLength(0)
+		expect(stages).toEqual(["passkey", "sending"])
 	})
 })
 

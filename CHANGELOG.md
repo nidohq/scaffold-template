@@ -32,6 +32,21 @@
   guesses with one device prompt each (fees 0.565 and 0.035 XLM, paid by Nido's
   relayer), the third refused by the 2 XLM/day cap.
 
+### A call says what it waits for
+
+- From Submit to the result, Guess the Number locks the input and the button (a
+  spinner and "Guessing…") and shows the stage in a live region: "Preparing…",
+  "Waiting for your passkey…", "Sending…", "Confirming on Stellar…". The
+  `--blank` check-in does the same. Before, nothing changed on screen for the 15
+  to 20 seconds a guess takes: the form used a React `action`, which holds state
+  updates until it ends, so "loading" never rendered.
+- `SessionGate` shows a spinner and says what it waits for while it makes the
+  app's passkey, waits for Nido's window (approve and renew) and checks the
+  chain.
+- `submitCall` and `submitContract` take `{ onStage }`; `submitWithSession`
+  reports `passkey`, `sending` and `confirming`, and the Nido popup path
+  `wallet` and `confirming`. New `Pending` component and `stageText`.
+
 ### Guess the Number shows the spending cap
 
 - The sample's XLM grant caps spending at 2 XLM a day (was 3), so two wrong

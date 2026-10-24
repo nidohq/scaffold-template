@@ -322,28 +322,26 @@ Chrome whose every tab and popup has a virtual passkey (the app's passkey is a
 virtual one too), and prints the settings for a browser driver such as
 chrome-devtools-axi. Create the account at https://test.nido.fyi in that
 browser. To try a Nido preview, set `PUBLIC_NIDO_BASE` in `app/.env`, e.g.
-`https://318.test.nido.fyi`.
+`https://<PR number>.test.nido.fyi`.
 
 ### Verified live on testnet
 
-With a Nido account created in an automated browser with throwaway virtual
-passkeys (`npm run test-browser`), against Nido's preview of grant requests with
-several grants and a passkey signer
-(`PUBLIC_NIDO_BASE=https://318.test.nido.fyi`):
+A first-time player against https://test.nido.fyi on 2026-10-24, in an automated
+browser with throwaway virtual passkeys:
 
-| Check (2026-10-23)                        | Result                                                                                                                            |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Create a Nido account                     | Deployed and funded with 5 XLM by Nido's relayer                                                                                  |
-| Connect through the wallet picker         | C-address and its 5 XLM balance in the header                                                                                     |
-| Make the app's passkey                    | One device prompt; `localStorage` holds its public key and credential id only                                                     |
-| Approve the session                       | One popup, both rules and the 2 XLM/day cap already filled in, one confirmation; `guess` and `guess-xlm` name the app passkey     |
-| Guess 1 and guess 2                       | One device prompt each, no Nido page; submitted by Nido's relayer: 0.565 and 0.035 XLM in fees, paid by the relayer               |
-| Guess 3                                   | Refused by the account: `#3221` (`SpendingLimitExceeded`); nothing sent, balance unchanged at 3 XLM                               |
-| Pay only the game (`to`, Nido `429c276f`) | Nido shows "Pays to: Only CBY4…" and, re-approving, "pays: any address → only CBY4S4…"; a wrong guess paid the game (`66f821e6…`) |
-| Re-approve a spent cap                    | Same rule id, same spending record: still "Cap reached", refused before any prompt                                                |
+| Check                           | Result                                                                                                                           |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Create a Nido account           | Deployed and funded with 5 XLM by Nido's relayer (the first try was refused while the relayer was busy; trying again worked)     |
+| Connect, make the app's passkey | One device prompt; `localStorage` holds its public key and credential id only                                                    |
+| Approve the session             | One popup: both rules, "Pays to: Only" the game, the 2 XLM/day cap filled in; one confirmation, 11.8 s to ready                  |
+| Guesses                         | One device prompt each, no Nido page; each paid the game 1 XLM (`ae39ae5b…`, `bac77b31…`), 9 to 11 s; the account went 5 → 3 XLM |
+| Over the cap                    | Stopped before the device was asked: "Cap reached until ≈ …", Submit off; nothing sent                                           |
+| Relayer busy                    | "Nido's relayer is busy, so nothing was sent": the guess cost nothing, and the next one went through                             |
+| Re-approve a spent cap          | Same rule, same spending record: still "Cap reached", refused before any prompt                                                  |
 
-Guesses `a5966b61fe9f47b804ddeeece967674c576e3c6c3834914e9532e86e4e13ce97` and
-`f912bd60e709c099203dea8aa4ffb485cda85111792a31c973fbeeef8d64452a`.
+Nido's relayer pays every fee; they follow testnet load. On 2026-10-23 a first
+guess cost 0.565 XLM and later ones 0.035 XLM; on 2026-10-24, under surge
+pricing, 3.3 and 0.2 XLM, and the approval 44 XLM.
 
 ## Troubleshooting
 

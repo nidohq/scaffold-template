@@ -2,86 +2,51 @@
 
 ## Unreleased
 
-### The session signer is a passkey
+### Passkey sessions: one approval, then one device prompt per call
 
-- A session's signer is now a second passkey the device makes for the app, on
-  the app's own origin, in place of an ed25519 key in `localStorage`. The
-  browser keeps only its public key and credential id, so nothing there can
-  spend, and the owner's Nido passkey is never used for play. The rules name it
+Needs Nido with nidohq/nido#318 (several grants per request, a passkey signer,
+`to=`), which test.nido.fyi runs.
+
+- **The session signer is a second passkey** the device makes for the app on its
+  own origin (`createAppPasskey`), in place of an ed25519 key in `localStorage`.
+  The browser keeps only its public key and credential id, so nothing there can
+  spend, and the owner's Nido passkey is never used to play. The rules name it
   as an `External` signer, checked by the account's WebAuthn verifier.
-- One approval: `SessionGate` makes the passkey on first use, then opens Nido's
-  grant page in a popup with every grant the screen needs (`grant.<i>.*`,
-  `pubkey=`). The owner confirms once, and the popup posts the answer back. A
-  blocked popup falls back to the page going to Nido; `resumeAppSession` reads
-  the answer on return. Uncapped grants are sent as `limit=none`, and the XLM
-  cap arrives filled in, so the owner types nothing.
-- Each session call asks the device once: the passkey signs the account's auth
-  entry in the account's digest scheme (`addr_oz_v1`, or `oz_rule_ids` for older
-  accounts), the account checks it, the rules and the cap in a simulation, and
-  Nido's relayer submits it and pays the fee. An over-cap call is refused before
-  it is sent.
-- New in app-lib: `createAppPasskey`, `nidoRelayer` (`PUBLIC_NIDO_RELAYER`),
-  `authDigest`, `webAuthnSigData`. `requestAppSession` resolves with Nido's
-  answer; `resumeAppSession` is synchronous. `grantUrl` builds the account host
-  with the module's `accountOrigin`, so a Nido preview base
-  (`https://318.test.nido.fyi`) reaches `<account>--318.test.nido.fyi`.
-- Removed: Friendbot funding of a session key, CAP-0071 delegate signing, and
-  `delegation=signed` (there is no key in the browser to pay with). Sessions
-  stored by an earlier version are dropped and asked for again.
-- Verified on testnet against Nido's preview: one approval for both rules, two
-  guesses with one device prompt each (fees 0.565 and 0.035 XLM, paid by Nido's
-  relayer), the third refused by the 2 XLM/day cap.
-
-### The XLM rule pays only the game
-
-- A `Grant` can name `to`, the only address its `transfer` may pay. The app
-  sends it as `grant.<i>.to` (Nido PR 318), which Nido writes as an `address-eq`
-  on transfer's argument 1, and shows as "Pays to: Only <game>". Guess the
-  Number's XLM grant names the game, so its passkey can no longer send the 2 XLM
-  a day to anyone else. `to` is only allowed on a grant whose functions are
-  exactly `["transfer"]`.
-- The app reads `to` back from the account's document, so `checkSession`,
-  coverage and rule selection see it. A grant whose `to` changed counts as
-  changed: a session approved before this asks again for its XLM rule, once.
-- Verified on testnet against Nido's preview (`429c276f`): re-approving the
-  walkthrough account's XLM rule showed "pays: any address → only CBY4S4…" in
-  Nido's diff and cost 0.328 XLM; on a fresh account the first approval cost
-  7.524 XLM (7.192 without `to`), and a wrong guess paid the game
-  (`66f821e6…4d4e`, account 5 → 4 XLM, game 2 → 3 XLM, fee 0.567 XLM).
-
-### The right rule, and a spent cap said before the prompt
-
-- The app picks the rule for each call by contract and function, reading the
-  functions from the account's policy document (`document()`), and prefers a
-  rule this app asked for over another rule on the same contract for the same
-  passkey (another gate's, or one left from an earlier approval), which could
-  charge the wrong cap. `authContexts` returns `{ contract, fn, args }`.
-- Before the passkey prompt, the app reads a capped rule's spending record (the
-  `spending_limit` policy's storage) and refuses a call that would go over:
-  `CapReachedError` with `until`, the time the oldest spend ages out. The
-  refusal is remembered per grant; `capReachedUntil(address, grants)` returns it
-  until then. Guess the Number shows "Cap reached until ≈ …" and keeps Submit
-  off, across reloads, instead of asking the device for a guess the account
-  would refuse. Approving the grant again clears the memory, and the next guess
-  reads the cap again: on testnet, re-approving a rule kept its id and its
-  spending record, so renewing doesn't refresh the cap.
-- The last guess's result sits inside the `SessionGate`, so the renew screen no
-  longer shows a stale refusal under it.
-
-### A call says what it waits for
-
-- From Submit to the result, Guess the Number locks the input and the button (a
-  spinner and "Guessing…") and shows the stage in a live region: "Preparing…",
-  "Waiting for your passkey…", "Sending…", "Confirming on Stellar…". The
-  `--blank` check-in does the same. Before, nothing changed on screen for the 15
-  to 20 seconds a guess takes: the form used a React `action`, which holds state
-  updates until it ends, so "loading" never rendered.
-- `SessionGate` shows a spinner and says what it waits for while it makes the
-  app's passkey, waits for Nido's window (approve and renew) and checks the
-  chain.
-- `submitCall` and `submitContract` take `{ onStage }`; `submitWithSession`
-  reports `passkey`, `sending` and `confirming`, and the Nido popup path
-  `wallet` and `confirming`. New `Pending` component and `stageText`.
+- **One approval.** `SessionGate` makes the passkey on first use, then opens
+  Nido's grant page in a popup with every grant the screen needs (`grant.<i>.*`,
+  `pubkey=`); the owner confirms once and the popup posts the answer back. A
+  blocked popup falls back to the page going to Nido, and `resumeAppSession`
+  reads the answer on return. Uncapped grants are sent as `limit=none`, and caps
+  arrive filled in.
+- **One device prompt per call.** The passkey signs the account's auth entry in
+  the account's digest scheme (`addr_oz_v1`, or `oz_rule_ids` for older
+  accounts); the account checks the signature, rules and cap in a simulation;
+  Nido's relayer submits and pays the fee (`PUBLIC_NIDO_RELAYER`, default
+  `https://nido.fly.dev`).
+- **Pays only the game.** A `Grant` can name `to`, the only address its
+  `transfer` may pay (`grant.<i>.to`, an `address-eq` on argument 1, shown by
+  Nido as "Pays to"). Guess the Number's XLM grant names the game, so the
+  passkey can't send its 2 XLM a day anywhere else.
+- **The right rule for each call**, by contract and function, read from the
+  account's policy document (`document()`), preferring this app's own grants
+  over other rules on the same contract.
+- **A spent cap is said before the prompt.** The app reads a capped rule's
+  spending record and refuses a call that would go over (`CapReachedError`, with
+  `until`); `capReachedUntil(address, grants)` remembers it, and Guess the
+  Number shows "Cap reached until ≈ …" with Submit off. Re-approving keeps the
+  rule's spending record, so renewing doesn't refresh a cap.
+- **A call says what it waits for.** `submitCall`/`submitContract` take
+  `{ onStage }` (`preparing`, `passkey` or `wallet`, `sending`, `confirming`);
+  the `Pending` component shows it with a spinner in a live region. Guess the
+  Number and the `--blank` check-in lock their form while a call runs, and
+  `SessionGate` does the same while it makes the passkey, waits for Nido and
+  checks the chain. The guess form is a submit handler, not a React form
+  `action` (which holds state updates until it ends).
+- **Removed:** Friendbot funding of a session key, CAP-0071 delegate signing and
+  `delegation=signed`. Sessions stored by an earlier version are dropped and
+  asked for again.
+- The PG Atlas SBOM workflow checks that the repository's dependency graph is on
+  and skips with a notice when it isn't, instead of failing on every push.
 
 ### Guess the Number shows the spending cap
 
@@ -92,8 +57,7 @@
 - The gate and the result say what a guess costs, and a refused guess says which
   cap stopped it and that it cost nothing, instead of the generic refusal.
 - `isOverCap(error)` in app-lib recognises the #3221 refusal, before or after
-  `describe` has explained it. The e2e mocks can refuse an enforced simulation
-  (`refuse`), and a test covers the over-cap guess.
+  `describe` has explained it, and a test covers the over-cap guess.
 
 ## v2 (2026-10-22): after the hackathon simulation
 

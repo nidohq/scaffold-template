@@ -8,7 +8,7 @@
 // generated clients, keys, secrets and test artifacts, and makes the copy its
 // own, so apps on one machine don't collide: the package name and page title,
 // a deployer identity named `<name>-deployer`, and a dev-server port of its
-// own (session keys live in the origin's storage, so the port must not
+// own (sessions live in the origin's storage, so the port must not
 // drift). `--blank` swaps the Guess the Number sample for a one-function
 // starter contract, `check-in`, and the matching screen.
 import {

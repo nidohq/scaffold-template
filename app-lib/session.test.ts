@@ -1,49 +1,75 @@
+import { createHash, generateKeyPairSync, sign, verify } from "node:crypto"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
+	Account,
 	Address,
-	Keypair,
 	Networks,
+	Operation,
 	StrKey,
-	SorobanDataBuilder,
+	TransactionBuilder,
+	contract,
+	hash,
 	nativeToScVal,
 	rpc,
+	scValToNative,
 	xdr,
 } from "@stellar/stellar-sdk"
 import {
 	activeSession,
 	authContexts,
+	authDigest,
 	authPayload,
+	CapReachedError,
+	capFreesAt,
+	capReachedUntil,
 	checkSession,
+	createSessionPasskey,
+	derToCompact,
 	describe as explain,
 	explainRefusal,
 	grantUrl,
 	isOverCap,
 	loadSession,
 	parseRules,
+	passkeySigners,
 	requestSession,
 	resumeSession,
 	ruleIdsFor,
 	sessionCovers,
 	sessionStatus,
+	submitWithSession,
+	webAuthnSigData,
 	type Grant,
 	type InstalledRule,
 	type Session,
+	type SessionPasskey,
 } from "./session"
 
 const account = StrKey.encodeContract(Buffer.alloc(32, 1))
 const sac = StrKey.encodeContract(Buffer.alloc(32, 2))
 const app = StrKey.encodeContract(Buffer.alloc(32, 3))
-const signer = Keypair.random().publicKey()
+const verifier = StrKey.encodeContract(Buffer.alloc(32, 4))
+const pending = "scaffold:nido-session:pending"
+
+/** A P-256 key standing in for the device's authenticator. */
+const device = generateKeyPairSync("ec", { namedCurve: "P-256" })
+const spki = device.publicKey.export({ format: "der", type: "spki" })
+const passkey: SessionPasskey = {
+	credentialId: "Y3JlZGVudGlhbA",
+	publicKey: spki.subarray(-65).toString("hex"),
+}
+/** Key data as Nido installs it: the public key, then the credential id. */
+const keyData = passkey.publicKey + Buffer.from("credential").toString("hex")
 
 const call = (
-	contract: string,
+	contractId: string,
 	subInvocations: xdr.SorobanAuthorizedInvocation[] = [],
 ) =>
 	new xdr.SorobanAuthorizedInvocation({
 		function:
 			xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
 				new xdr.InvokeContractArgs({
-					contractAddress: new Address(contract).toScAddress(),
+					contractAddress: new Address(contractId).toScAddress(),
 					functionName: "f",
 					args: [],
 				}),
@@ -54,154 +80,7 @@ const call = (
 afterEach(() => {
 	localStorage.clear()
 	vi.unstubAllGlobals()
-})
-
-describe("session grants", () => {
-	it("builds Nido's grant URL on the account's own subdomain", () => {
-		const url = new URL(
-			grantUrl({
-				base: "https://test.nido.fyi",
-				account,
-				signer,
-				grant: {
-					target: sac,
-					functions: ["transfer"],
-					duration: "24h",
-					limit: { amount: "2", period: "day" },
-					label: "kudos",
-				},
-				returnUrl: "http://127.0.0.1:5180/board",
-			}),
-		)
-		expect(url.host).toBe(`${account.toLowerCase()}.test.nido.fyi`)
-		expect(url.pathname).toBe("/security/delegate-doc/")
-		expect(Object.fromEntries(url.searchParams)).toEqual({
-			origin: "http://127.0.0.1:5180",
-			target: sac,
-			signer,
-			functions: "transfer",
-			duration: "24h",
-			limit: "2",
-			limit_period: "day",
-			label: "kudos",
-			return: "http://127.0.0.1:5180/board",
-		})
-	})
-	it("keeps a local wallet's scheme and refuses labels Perch would reject", () => {
-		const grant = { target: sac, duration: "7d" as const, label: "x" }
-		expect(
-			grantUrl({
-				base: "http://localhost:4321",
-				account,
-				signer,
-				grant,
-				returnUrl: "http://localhost:5180/",
-			}),
-		).toMatch(/^http:\/\/c[a-z0-9]+\.localhost:4321\//)
-		expect(() =>
-			grantUrl({
-				base: "https://test.nido.fyi",
-				account,
-				signer,
-				grant: { ...grant, label: "a label that is far too long" },
-				returnUrl: "http://localhost:5180/",
-			}),
-		).toThrow(/20 bytes/)
-	})
-})
-
-describe("session authorization", () => {
-	const rules: InstalledRule[] = [
-		{
-			id: 0,
-			name: "admin",
-			contract: account,
-			delegated: [],
-			validUntil: undefined,
-		},
-		{ id: 3, name: "app", contract: app, delegated: [signer], validUntil: 900 },
-		{
-			id: 4,
-			name: "spend",
-			contract: sac,
-			delegated: [signer],
-			validUntil: 900,
-		},
-	]
-	it("lists authorized contracts in the order __check_auth sees them", () => {
-		expect(
-			authContexts(call(app, [call(sac), call(app, [call(sac)])])),
-		).toEqual([app, sac, app, sac])
-	})
-	it("selects the signer's unexpired rule for each context", () => {
-		expect(ruleIdsFor([app, sac], rules, signer, 900)).toEqual([3, 4])
-		expect(() => ruleIdsFor([sac], rules, signer, 901)).toThrow(/expired/)
-		expect(() => ruleIdsFor([account], rules, signer, 1)).toThrow(account)
-		const other = Keypair.random().publicKey()
-		expect(() => ruleIdsFor([sac], rules, other, 1)).toThrow()
-	})
-	it("encodes the AuthPayload a Perch account expects", () => {
-		const payload = authPayload([4], signer)
-		const [ids, signers] = payload.map()!
-		expect(ids?.key().sym().toString()).toBe("context_rule_ids")
-		expect(
-			ids
-				?.val()
-				.vec()
-				?.map((v) => v.u32()),
-		).toEqual([4])
-		expect(signers?.key().sym().toString()).toBe("signers")
-		const [entry] = signers!.val().map()!
-		const [tag, address] = entry!.key().vec()!
-		expect(tag?.sym().toString()).toBe("Delegated")
-		expect(Address.fromScVal(address!).toString()).toBe(signer)
-		expect(entry!.val().bytes().length).toBe(0)
-		expect(xdr.ScVal.fromXDR(payload.toXDR()).toXDR("base64")).toBe(
-			payload.toXDR("base64"),
-		)
-	})
-	it("decodes installed_rules in either tuple-enum shape", () => {
-		expect(
-			parseRules([
-				{
-					id: 1,
-					name: "probe",
-					context_type: ["CallContract", sac],
-					signers: [["Delegated", signer]],
-					valid_until: 5342016,
-				},
-				{
-					id: 0,
-					name: "admin",
-					context_type: { CallContract: account },
-					signers: [{ External: ["C", new Uint8Array(65)] }],
-					valid_until: null,
-				},
-			]),
-		).toEqual([
-			{
-				id: 1,
-				name: "probe",
-				contract: sac,
-				delegated: [signer],
-				validUntil: 5342016,
-			},
-			{
-				id: 0,
-				name: "admin",
-				contract: account,
-				delegated: [],
-				validUntil: undefined,
-			},
-		])
-	})
-	it("explains the refusals a person can act on", () => {
-		expect(explainRefusal("HostError: Error(Contract, #3221)")).toMatch(
-			/spending cap/,
-		)
-		expect(explainRefusal("Error(Contract, #3002)")).toMatch(/no approved rule/)
-		expect(explainRefusal("network down")).toBe("network down")
-	})
+	vi.useRealTimers()
 })
 
 const hour = 3_600_000
@@ -215,44 +94,329 @@ const spend: Grant = {
 	target: sac,
 	functions: ["transfer"],
 	duration: "24h",
-	limit: { amount: "3", period: "day" },
+	limit: { amount: "2", period: "day" },
 	label: "spend",
 }
-const key = Keypair.random()
 const store = (grants: Session["grants"], extra: Partial<Session> = {}) =>
 	localStorage.setItem(
 		`scaffold:nido-session:${account}`,
-		JSON.stringify({
-			account,
-			publicKey: key.publicKey(),
-			secret: key.secret(),
-			grants,
-			...extra,
-		}),
+		JSON.stringify({ account, passkey, grants, ...extra }),
 	)
-const visit = (href: string) => {
-	const assign = vi.fn()
-	const replaceState = vi.fn()
-	vi.stubGlobal("window", {
-		location: { href, assign },
-		history: { replaceState },
+
+describe("asking Nido for grants", () => {
+	const ask = (base: string, grants = [play, spend]) =>
+		new URL(
+			grantUrl({
+				base,
+				account,
+				passkey,
+				grants,
+				returnUrl: "http://localhost:5180/board",
+			}),
+		)
+	it("sends every grant for the app's passkey in one request", () => {
+		const url = ask("https://test.nido.fyi")
+		expect(url.host).toBe(`${account.toLowerCase()}.test.nido.fyi`)
+		expect(url.pathname).toBe("/security/delegate-doc/")
+		expect(Object.fromEntries(url.searchParams)).toEqual({
+			origin: "http://localhost:5180",
+			pubkey: passkey.publicKey,
+			duration: "24h",
+			"grant.0.label": "play",
+			"grant.0.target": app,
+			"grant.0.functions": "play",
+			// The app declares a rule without a cap uncapped
+			"grant.0.limit": "none",
+			"grant.1.label": "spend",
+			"grant.1.target": sac,
+			"grant.1.functions": "transfer",
+			"grant.1.limit": "2",
+			"grant.1.limit_period": "day",
+			return: "http://localhost:5180/board",
+		})
 	})
-	return { assign, replaceState }
-}
-const resume = (server = {} as rpc.Server) =>
-	resumeSession({
-		base: "https://test.nido.fyi",
-		server,
-		networkPassphrase: Networks.TESTNET,
+	it("finds the account on a Nido preview and on a local wallet", () => {
+		expect(ask("https://318.test.nido.fyi").host).toBe(
+			`${account.toLowerCase()}--318.test.nido.fyi`,
+		)
+		expect(ask("http://localhost:4321").origin).toBe(
+			`http://${account.toLowerCase()}.localhost:4321`,
+		)
 	})
+	it("names the only address a transfer grant may pay", () => {
+		const url = ask("https://test.nido.fyi", [play, { ...spend, to: app }])
+		expect(url.searchParams.get("grant.1.to")).toBe(app)
+		expect(url.searchParams.has("grant.0.to")).toBe(false)
+		// Nido takes `to` only on a grant whose functions are exactly transfer
+		expect(() => ask("https://test.nido.fyi", [{ ...play, to: app }])).toThrow(
+			/exactly \["transfer"\]/,
+		)
+	})
+	it("refuses requests Nido would reject", () => {
+		const long = { ...play, label: "a label that is far too long" }
+		expect(() => ask("https://test.nido.fyi", [long])).toThrow(/20 bytes/)
+		const week = { ...spend, duration: "7d" as const }
+		expect(() => ask("https://test.nido.fyi", [play, week])).toThrow(
+			/share one duration/,
+		)
+		const nine = Array.from({ length: 9 }, (_, i) => ({
+			...play,
+			label: `g${i}`,
+		}))
+		expect(() => ask("https://test.nido.fyi", nine)).toThrow(/at most 8/)
+	})
+})
+
+describe("session authorization", () => {
+	const rule = (
+		id: number,
+		name: string,
+		contract: string,
+		functions: string[] | undefined,
+		key = keyData,
+	): InstalledRule => ({
+		id,
+		name,
+		contract,
+		functions,
+		policies: [],
+		external: [{ verifier, key }],
+		delegated: [],
+		validUntil: 900,
+	})
+	const rules: InstalledRule[] = [
+		{ ...rule(0, "admin", account, undefined, "04".padEnd(130, "a")) },
+		rule(3, "app", app, ["f"]),
+		rule(4, "spend", sac, ["transfer"]),
+	]
+	const ctx = (contract: string, fn = "f") => ({ contract, fn, args: [] })
+	it("lists the calls in the order __check_auth sees them", () => {
+		const contexts = authContexts(
+			call(app, [call(sac), call(app, [call(sac)])]),
+		)
+		expect(contexts.map((c) => c.contract)).toEqual([app, sac, app, sac])
+		expect(contexts.every((c) => c.fn === "f")).toBe(true)
+	})
+	it("selects the passkey's unexpired rule for each call", () => {
+		expect(
+			ruleIdsFor([ctx(app), ctx(sac, "transfer")], rules, passkey, 900),
+		).toEqual([3, 4])
+		expect(() =>
+			ruleIdsFor([ctx(sac, "transfer")], rules, passkey, 901),
+		).toThrow(/expired/)
+		expect(() => ruleIdsFor([ctx(account)], rules, passkey, 1)).toThrow(account)
+		const other = { ...passkey, publicKey: "04".padEnd(130, "b") }
+		expect(() => ruleIdsFor([ctx(sac, "transfer")], rules, other, 1)).toThrow()
+		expect(passkeySigners([3, 4], rules, passkey)).toEqual([
+			{ verifier, key: keyData },
+		])
+	})
+	it("matches the function, and prefers this app's own rule over a decoy on the same token", () => {
+		// Decoys on the XLM contract, listed first: one allows only `approve`,
+		// one allows `transfer` but is no grant of this session (another gate's
+		// rule, or one left from an earlier approval, with its own cap)
+		const decoys = [
+			rule(7, "allowance", sac, ["approve"]),
+			rule(8, "old-spend", sac, ["transfer"]),
+		]
+		const all = [...decoys, ...rules]
+		const transfer = [ctx(sac, "transfer")]
+		expect(ruleIdsFor(transfer, all, passkey, 900, ["app", "spend"])).toEqual([
+			4,
+		])
+		// Without labels, the function still rules out `approve`
+		expect(ruleIdsFor(transfer, all, passkey, 900)).toEqual([8])
+		expect(() =>
+			ruleIdsFor([ctx(sac, "burn")], all, passkey, 900, ["spend"]),
+		).toThrow(/burn on/)
+		// A rule the document doesn't list allows any function
+		expect(
+			ruleIdsFor(
+				[ctx(app, "reset")],
+				[rule(9, "any", app, undefined)],
+				passkey,
+				900,
+			),
+		).toEqual([9])
+	})
+	it("finds when a cap lets an amount through again", () => {
+		const window = {
+			limit: 20_000_000n,
+			periodLedgers: 17_280,
+			spent: [
+				{ amount: 10_000_000n, ledger: 1_000 },
+				{ amount: 10_000_000n, ledger: 1_500 },
+			],
+		}
+		// Room for nothing more until the first spend ages out
+		expect(capFreesAt(window, 10_000_000n, 2_000)).toBe(1_000 + 17_280)
+		expect(capFreesAt(window, 20_000_000n, 2_000)).toBe(1_500 + 17_280)
+		expect(capFreesAt(window, 30_000_000n, 2_000)).toBeUndefined()
+		// An entry stops counting period_ledgers after its own ledger
+		expect(capFreesAt(window, 10_000_000n, 1_000 + 17_280)).toBe(1_000 + 17_280)
+		expect(capFreesAt({ ...window, spent: [] }, 20_000_000n, 5)).toBe(5)
+	})
+	it("encodes the AuthPayload byte for byte as Perch does", () => {
+		// perch testdata/auth/auth-vectors.json, auth_payload (external signer)
+		const payload = authPayload(
+			[0, 9],
+			[
+				{
+					verifier: "CDGGTZJDHAPV3S5LD36GAETRHWZ6ASCEZ5YRH7O5JOK3WXW55RRHOLL5",
+					key: "aa".repeat(65),
+				},
+			],
+			Buffer.alloc(64, 1),
+		)
+		expect(payload.toXDR("hex")).toBe(
+			"0000001100000001000000020000000f00000010636f6e746578745f72756c655f696473000000100000000100000002000000030000000000000003000000090000000f000000077369676e657273000000001100000001000000010000001000000001000000030000000f0000000845787465726e616c0000001200000001cc69e523381f5dcbab1efc6012713db3e04844cf7113fddd4b95bb5eddec62770000000d00000041" +
+				"aa".repeat(65) +
+				"0000000000000d00000040" +
+				"01".repeat(64),
+		)
+	})
+	it("signs the digest each kind of account recomputes", async () => {
+		// perch testdata/auth/auth-vectors.json, signing_digest (addr_oz_v1)
+		const vectors = [
+			[
+				"837885c8f8091aeaeb9ec3c3f85a6ff470a415e610b8ba3e49f9b33c9cf9d619",
+				[],
+				"2d6b4c41959204bf3e439539be30d0e8f358499867c42158e2faf20eec5d680a",
+			],
+			[
+				"da4a51839ac39aec93a9000e4ac50b7441655d1569772703e4ecf90d46c4dac5",
+				[1, 2, 3],
+				"51e5fa49edb7b9bcd2c3ee5a14bb9f995e95929318cdc6fbaaf005b5504572df",
+			],
+			[
+				"12a552b1c1b28ed6ca45d87d75e9d2ce7764ed42bc3f9586e2228d02e9879ea0",
+				[4294967295, 7],
+				"a80e2b10a7a271711943ee8c4e600f6287c8a20e1a90c2e3d25afb3bfc8a4214",
+			],
+		] as const
+		const perchAccount =
+			"CC5QACNC45UM2FLTKPXD2TME7647YHUPF4PGHQBFRP26PHHDQ6LWAPBF"
+		for (const [payload, ids, digest] of vectors)
+			expect(
+				Buffer.from(
+					await authDigest(
+						perchAccount,
+						Buffer.from(payload, "hex"),
+						[...ids],
+						"addr_oz_v1",
+					),
+				).toString("hex"),
+			).toBe(digest)
+		// Accounts made before the address binding hash the payload and ids only
+		const [payload, ids] = vectors[1]
+		const unbound = createHash("sha256")
+			.update(Buffer.from(payload, "hex"))
+			.update(xdr.ScVal.scvVec(ids.map((id) => xdr.ScVal.scvU32(id))).toXDR())
+			.digest("hex")
+		expect(
+			Buffer.from(
+				await authDigest(
+					account,
+					Buffer.from(payload, "hex"),
+					[...ids],
+					"oz_rule_ids",
+				),
+			).toString("hex"),
+		).toBe(unbound)
+	})
+	it("turns the device's DER signature into a low-S r‖s", () => {
+		const message = Buffer.from("message")
+		for (let i = 0; i < 8; i++) {
+			const der = sign("sha256", message, device.privateKey)
+			const compact = derToCompact(der)
+			expect(compact).toHaveLength(64)
+			expect(compact[32]! < 0x80).toBe(true)
+			expect(
+				verify(
+					"sha256",
+					message,
+					{ key: device.publicKey, dsaEncoding: "ieee-p1363" },
+					compact,
+				),
+			).toBe(true)
+		}
+	})
+	it("decodes installed_rules in either tuple-enum shape, with the document's functions and cap", () => {
+		expect(
+			parseRules(
+				[
+					{
+						id: 1,
+						name: "probe",
+						context_type: ["CallContract", sac],
+						signers: [["External", verifier, Buffer.from(keyData, "hex")]],
+						policies: [{ policy: app }],
+						valid_until: 5342016,
+					},
+					{
+						id: 0,
+						name: "admin",
+						context_type: { CallContract: account },
+						signers: [
+							{ External: [verifier, new Uint8Array(65)] },
+							{ Delegated: sac },
+						],
+						valid_until: null,
+					},
+				],
+				{
+					rules: [
+						{
+							name: "probe",
+							functions: ["transfer"],
+							args: [{ index: 1, pred: { type: "address-eq", address: app } }],
+							cap: { limit: "20000000", "period-ledgers": 17280 },
+							scope: { type: "contract", address: sac },
+						},
+						{ name: "admin", scope: { type: "self-admin" } },
+					],
+				},
+			),
+		).toEqual([
+			{
+				id: 1,
+				name: "probe",
+				contract: sac,
+				functions: ["transfer"],
+				cap: { limit: 20_000_000n, periodLedgers: 17_280 },
+				to: app,
+				policies: [app],
+				external: [{ verifier, key: keyData }],
+				delegated: [],
+				validUntil: 5342016,
+			},
+			{
+				id: 0,
+				name: "admin",
+				contract: account,
+				functions: undefined,
+				policies: [],
+				external: [{ verifier, key: "00".repeat(65) }],
+				delegated: [sac],
+				validUntil: undefined,
+			},
+		])
+	})
+	it("explains the refusals a person can act on", () => {
+		expect(explainRefusal("HostError: Error(Contract, #3221)")).toMatch(
+			/spending cap/,
+		)
+		expect(explainRefusal("Error(Contract, #3002)")).toMatch(/no approved rule/)
+		expect(explainRefusal("network down")).toBe("network down")
+	})
+})
 
 describe("session coverage", () => {
 	it("needs the same target, functions and cap, unexpired", () => {
 		const now = 1_000 * hour
-		const session = {
+		const session: Session = {
 			account,
-			publicKey: signer,
-			secret: "S",
+			passkey,
 			grants: [
 				{ ...play, expiresAt: now + hour },
 				{ ...spend, expiresAt: now + 2 * hour },
@@ -265,19 +429,25 @@ describe("session coverage", () => {
 		const moved = { ...play, target: sac }
 		const wider = { ...play, functions: ["play", "reset"] }
 		const capped = { ...spend, limit: { amount: "5", period: "day" as const } }
-		expect(sessionCovers(session, [moved, wider, capped], now).ask).toEqual([
-			moved,
-			wider,
-			capped,
-		])
+		// An approval that pays anyone is not one that pays only the game
+		const payee = { ...spend, to: app }
+		expect(
+			sessionCovers(session, [moved, wider, capped, payee], now).ask,
+		).toEqual([moved, wider, capped, payee])
 		expect(sessionCovers(session, [play], now + hour).expired).toEqual([play])
 	})
-	it("tells a gate whether to ask, wait, renew or go ahead", () => {
+	it("tells a gate whether to make a passkey, ask, wait, renew or go ahead", () => {
 		const now = 1_000 * hour
 		expect(sessionStatus(account, [play], now)).toEqual({
 			state: "ask",
 			ask: [play],
 			reason: "new",
+			passkey: false,
+		})
+		store([])
+		expect(sessionStatus(account, [play], now)).toMatchObject({
+			reason: "new",
+			passkey: true,
 		})
 		store([{ ...play, expiresAt: now + hour }, spend])
 		expect(sessionStatus(account, [play], now).state).toBe("ready")
@@ -298,229 +468,259 @@ describe("session coverage", () => {
 		expect(activeSession(account, now)).toBeDefined()
 		expect(activeSession(account, now + hour)).toBeUndefined()
 	})
-	it("treats sessions stored before expiry tracking as expired", () => {
+	it("drops a session from before passkeys: its ed25519 key no longer signs", () => {
 		localStorage.setItem(
 			`scaffold:nido-session:${account}`,
-			JSON.stringify({
-				account,
-				publicKey: signer,
-				secret: "S",
-				grants: [play, spend],
-				approved: 1,
-			}),
+			JSON.stringify({ account, publicKey: "G", secret: "S", grants: [play] }),
 		)
-		expect(loadSession(account)?.grants).toEqual([
-			{ ...play, expiresAt: 0 },
-			spend,
-		])
+		expect(loadSession(account)).toBeUndefined()
+		expect(sessionStatus(account, [play])).toMatchObject({ passkey: false })
 	})
 })
 
+describe("the app's passkey", () => {
+	const page = (hostname: string) =>
+		vi.stubGlobal("window", { location: { hostname } })
+	it("keeps only the public key and credential id", async () => {
+		page("localhost")
+		const create = vi.fn(async () => ({
+			rawId: Uint8Array.from(Buffer.from("credential")).buffer,
+			response: {
+				getPublicKey: () => Uint8Array.from(spki).buffer,
+				getPublicKeyAlgorithm: () => -7,
+			},
+		}))
+		vi.stubGlobal("navigator", { credentials: { create } })
+		store([{ ...play, expiresAt: Date.now() + hour }])
+		const session = await createSessionPasskey(account, "Guess")
+		expect(session).toEqual({ account, passkey, grants: [] })
+		expect(
+			JSON.parse(localStorage.getItem(`scaffold:nido-session:${account}`)!),
+		).toEqual({ account, passkey, grants: [] })
+		const options = (
+			create.mock.calls[0] as unknown as [
+				{ publicKey: PublicKeyCredentialCreationOptions },
+			]
+		)[0].publicKey
+		expect(options.rp.id).toBe("localhost")
+		expect(options.pubKeyCredParams).toEqual([{ type: "public-key", alg: -7 }])
+		expect(options.authenticatorSelection?.userVerification).toBe("required")
+	})
+	it("needs a host name, which an IP address is not", async () => {
+		page("127.0.0.1")
+		await expect(createSessionPasskey(account, "Guess")).rejects.toThrow(
+			/open this app at localhost/,
+		)
+	})
+})
+
+/** A page whose popups and messages the test controls. */
+const browser = (href: string, { blocked = false } = {}) => {
+	const listeners = new Set<(event: unknown) => void>()
+	const popup = { closed: false, close: vi.fn() }
+	const assign = vi.fn()
+	const replaceState = vi.fn()
+	const open = vi.fn((_url: string, _name?: string, _features?: string) =>
+		blocked ? null : popup,
+	)
+	vi.stubGlobal("window", {
+		location: { href, hostname: new URL(href).hostname, assign },
+		history: { replaceState },
+		open,
+		addEventListener: (_: string, l: (event: unknown) => void) =>
+			listeners.add(l),
+		removeEventListener: (_: string, l: (event: unknown) => void) =>
+			listeners.delete(l),
+	})
+	/** Nido's page posts `search` back to the app and closes. */
+	const answer = (search: string) => {
+		const origin = new URL(open.mock.calls[0]![0]).origin
+		for (const listener of [...listeners])
+			listener({
+				origin,
+				source: popup,
+				data: { source: "nido-wallet", search },
+			})
+	}
+	return { open, assign, replaceState, popup, answer }
+}
+const request = (grants = [play, spend]) =>
+	requestSession({ account, grants, base: "https://test.nido.fyi" })
+
 describe("asking for and resuming a session", () => {
-	it("reuses the app's key and replaces a grant asked for again", async () => {
-		const friendbot = vi.fn()
-		vi.stubGlobal("fetch", friendbot)
+	it("opens one popup for every grant and records Nido's approval", async () => {
 		store([{ ...play, expiresAt: 1 }])
-		const { assign } = visit("http://127.0.0.1:5180/board?x=1#top")
-		void requestSession({
-			account,
-			grants: [play, spend],
-			base: "https://test.nido.fyi",
-			friendbotUrl: (a) => a,
-		})
-		await vi.waitFor(() => expect(assign).toHaveBeenCalled())
-		expect(friendbot).not.toHaveBeenCalled()
-		const url = new URL(assign.mock.calls[0]![0] as string)
-		expect(url.searchParams.get("signer")).toBe(key.publicKey())
-		expect(url.searchParams.get("label")).toBe("play")
-		expect(url.searchParams.get("return")).toBe("http://127.0.0.1:5180/board")
+		const page = browser("http://localhost:5180/board?x=1#top")
+		const result = request()
+		const url = new URL(page.open.mock.calls[0]![0])
+		expect(url.searchParams.get("pubkey")).toBe(passkey.publicKey)
+		expect(url.searchParams.get("grant.1.label")).toBe("spend")
+		expect(url.searchParams.get("return")).toBe("http://localhost:5180/board")
 		expect(loadSession(account)?.grants).toEqual([play, spend])
+		page.answer("?delegation=ok")
+		expect(await result).toEqual({ account, outcome: "approved" })
+		for (const grant of loadSession(account)!.grants)
+			expect(grant.expiresAt! - Date.now()).toBeGreaterThan(23 * hour)
+		expect(localStorage.getItem(pending)).toBeNull()
 	})
-	it("funds a new key only for the first request", async () => {
-		const friendbot = vi.fn().mockResolvedValue({ ok: true })
-		vi.stubGlobal("fetch", friendbot)
-		const { assign } = visit("http://127.0.0.1:5180/")
-		void requestSession({
-			account,
-			grants: [play],
-			base: "https://test.nido.fyi",
-			friendbotUrl: (a) => `https://friendbot/?addr=${a}`,
-		})
-		await vi.waitFor(() => expect(assign).toHaveBeenCalled())
-		const session = loadSession(account)!
-		expect(friendbot).toHaveBeenCalledWith(
-			`https://friendbot/?addr=${session.publicKey}`,
-		)
+	it("asks for grants with another duration in a second request", async () => {
+		store([])
+		const page = browser("http://localhost:5180/")
+		void request([play, { ...spend, duration: "7d" }])
+		const url = new URL(page.open.mock.calls[0]![0])
+		expect(url.searchParams.has("grant.1.label")).toBe(false)
+		expect(loadSession(account)?.grants).toEqual([play])
 	})
-	it("records ok answers and moves on to the next grant", async () => {
-		store([play, spend])
-		localStorage.setItem("scaffold:nido-session:pending", account)
-		const first = visit("http://127.0.0.1:5180/?delegation=ok")
-		expect(await resume()).toEqual({ account, outcome: "next-grant" })
-		expect(first.assign.mock.calls[0]?.[0]).toContain("label=spend")
-		visit("http://127.0.0.1:5180/#delegation=ok")
-		expect((await resume())?.outcome).toBe("approved")
-		const [a, b] = loadSession(account)!.grants
-		expect(a!.expiresAt! - Date.now()).toBeGreaterThan(23 * hour)
-		expect(b!.expiresAt).toBeDefined()
-		expect(await resume()).toBeNull()
-	})
-	it("keeps the key and approved grants when the owner cancels", async () => {
-		store([{ ...play, expiresAt: Date.now() + hour }, spend])
-		localStorage.setItem("scaffold:nido-session:pending", account)
-		const { replaceState } = visit(
-			"http://127.0.0.1:5180/?delegation=cancelled",
-		)
-		expect((await resume())?.outcome).toBe("cancelled")
+	it("keeps the passkey and approved grants when the owner cancels", async () => {
+		store([{ ...play, expiresAt: Date.now() + hour }])
+		const page = browser("http://localhost:5180/")
+		const result = request([spend])
+		page.answer("?delegation=cancelled")
+		expect((await result).outcome).toBe("cancelled")
 		expect(loadSession(account)?.grants.map((g) => g.label)).toEqual(["play"])
-		expect(String(replaceState.mock.calls.at(-1)?.[2])).not.toContain(
-			"delegation",
-		)
+		expect(loadSession(account)?.passkey).toEqual(passkey)
 	})
-	it("reports a relayer refusal and leaves the grant waiting", async () => {
-		store([spend])
-		localStorage.setItem("scaffold:nido-session:pending", account)
-		visit("http://127.0.0.1:5180/?delegation=error&code=FEE_LIMIT_EXCEEDED")
-		expect(await resume()).toMatchObject({
+	it("reports a relayer refusal and leaves the grants waiting", async () => {
+		store([])
+		const page = browser("http://localhost:5180/")
+		const result = request()
+		page.answer("?delegation=error&code=FEE_LIMIT_EXCEEDED")
+		expect(await result).toMatchObject({
 			outcome: "refused",
 			message: expect.stringMatching(/budget is used up.*nothing was sent/),
 		})
-		expect(sessionStatus(account, [spend])).toMatchObject({
+		expect(sessionStatus(account, [play, spend])).toMatchObject({
 			state: "waiting",
 			session: { refused: "FEE_LIMIT_EXCEEDED" },
 		})
 	})
+	it("leaves the grants waiting when Nido's window closes without an answer", async () => {
+		vi.useFakeTimers()
+		store([])
+		const page = browser("http://localhost:5180/")
+		const result = request()
+		page.popup.closed = true
+		await vi.advanceTimersByTimeAsync(600)
+		expect(await result).toEqual({ account, outcome: "closed" })
+		expect(sessionStatus(account, [play, spend]).state).toBe("waiting")
+	})
+	it("goes to Nido in the page when the popup is blocked, and resumes on return", () => {
+		store([])
+		const page = browser("http://localhost:5180/", { blocked: true })
+		void request()
+		return vi.waitFor(() => {
+			expect(page.assign).toHaveBeenCalled()
+			expect(String(page.assign.mock.calls[0]![0])).toContain(
+				"/security/delegate-doc/",
+			)
+			expect(localStorage.getItem(pending)).toBe(account)
+			const back = browser("http://localhost:5180/#delegation=ok")
+			expect(resumeSession()).toEqual({ account, outcome: "approved" })
+			expect(String(back.replaceState.mock.calls[0]![2])).not.toContain(
+				"delegation",
+			)
+			expect(resumeSession()).toBeNull()
+		})
+	})
+	it("needs the app's passkey first", () => {
+		browser("http://localhost:5180/")
+		expect(() => request()).toThrow(/passkey/)
+	})
 })
 
-describe("paying for a refused approval with the app's key", () => {
-	const applyDoc = (target: string, by: string) => ({
-		func: xdr.HostFunction.hostFunctionTypeInvokeContract(
-			new xdr.InvokeContractArgs({
-				contractAddress: new Address(target).toScAddress(),
-				functionName: "apply_doc",
-				args: [nativeToScVal("doc")],
-			}),
-		).toXDR("base64"),
-		auth: [
-			new xdr.SorobanAuthorizationEntry({
-				credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(
-					new xdr.SorobanAddressCredentials({
-						address: new Address(by).toScAddress(),
-						nonce: xdr.Int64.fromString("1"),
-						signatureExpirationLedger: 99,
-						signature: nativeToScVal("passkey"),
-					}),
-				),
-				rootInvocation: call(target),
-			}).toXDR("base64"),
-		],
-	})
-	const encode = (payload: object) =>
-		Buffer.from(JSON.stringify(payload)).toString("base64url")
-	const network = () => {
-		const sent: string[] = []
-		const server = {
-			getAccount: vi.fn(async (id: string) => ({
-				accountId: () => id,
-				sequenceNumber: () => "1",
-				incrementSequenceNumber: () => {},
-			})),
-			simulateTransaction: vi.fn(async () =>
-				rpc.parseRawSimulation({
-					id: "1",
-					latestLedger: 10,
-					minResourceFee: "100",
-					transactionData: new SorobanDataBuilder().build().toXDR("base64"),
-					results: [{ auth: [], xdr: nativeToScVal(null).toXDR("base64") }],
-				} as unknown as rpc.Api.RawSimulateTransactionResponse),
-			),
-			sendTransaction: vi.fn(async (tx: { toXDR: () => string }) => {
-				sent.push(tx.toXDR())
-				return { status: "PENDING", hash: "cd".repeat(32) }
-			}),
-			pollTransaction: vi.fn(async () => ({ status: "SUCCESS" })),
-		}
-		return { server: server as unknown as rpc.Server, sent }
-	}
-	it("submits the passkey-signed call itself and approves the grant", async () => {
-		store([spend])
-		localStorage.setItem("scaffold:nido-session:pending", account)
-		const { server, sent } = network()
-		visit(
-			`http://127.0.0.1:5180/?delegation=signed#payload=${encode(applyDoc(account, account))}`,
-		)
-		expect(await resume(server)).toEqual({
-			account,
-			outcome: "approved",
-			hash: "cd".repeat(32),
-		})
-		const envelope = xdr.TransactionEnvelope.fromXDR(sent[0]!, "base64")
-		const tx = envelope.v1().tx()
-		expect(StrKey.encodeEd25519PublicKey(tx.sourceAccount().ed25519())).toBe(
-			key.publicKey(),
-		)
-		const [entry] = tx.operations()[0]!.body().invokeHostFunctionOp().auth()
-		expect(entry!.credentials().address().signature().str().toString()).toBe(
-			"passkey",
-		)
-		expect(envelope.v1().signatures()).toHaveLength(1)
-	})
-	it("refuses a payload that is not a change to the pending account", async () => {
-		for (const payload of [applyDoc(app, account), applyDoc(account, app)]) {
-			store([spend])
-			localStorage.setItem("scaffold:nido-session:pending", account)
-			const { server, sent } = network()
-			visit(
-				`http://127.0.0.1:5180/?delegation=signed&payload=${encode(payload)}`,
-			)
-			expect(await resume(server)).toMatchObject({
-				outcome: "refused",
-				message: "Nido's signed approval is not a change to your account",
-			})
-			expect(sent).toHaveLength(0)
-		}
-	})
+/** A simulation that reads `retval`, as the RPC client parses one. */
+const simulated = (retval: xdr.ScVal, latestLedger = 1_000) => ({
+	latestLedger,
+	transactionData: {},
+	result: { retval, auth: [] },
 })
+const installed = (
+	rules: { id: number; name: string; contract: string; key: string }[],
+) =>
+	nativeToScVal(
+		rules.map(({ id, name, contract: target, key }) => ({
+			context_type: xdr.ScVal.scvVec([
+				xdr.ScVal.scvSymbol("CallContract"),
+				new Address(target).toScVal(),
+			]),
+			id: nativeToScVal(id, { type: "u32" }),
+			name,
+			signers: xdr.ScVal.scvVec([
+				xdr.ScVal.scvVec([
+					xdr.ScVal.scvSymbol("External"),
+					new Address(verifier).toScVal(),
+					nativeToScVal(Buffer.from(key, "hex")),
+				]),
+			]),
+			valid_until: nativeToScVal(1_720, { type: "u32" }),
+		})),
+		{ type: { id: ["symbol", null] } },
+	)
 
 describe("checking the chain for what landed", () => {
+	it("counts a grant that names a recipient only when the rule pays that address", async () => {
+		const server = (args: object[] | undefined) =>
+			({
+				simulateTransaction: vi.fn(
+					async (tx: { operations: Operation.InvokeHostFunction[] }) =>
+						tx.operations[0]!.func.invokeContract()
+							.functionName()
+							.toString() === "document"
+							? simulated(
+									xdr.ScVal.scvVec([
+										nativeToScVal(1, { type: "u64" }),
+										nativeToScVal(
+											Buffer.from(
+												JSON.stringify({
+													rules: [
+														{
+															name: "spend",
+															functions: ["transfer"],
+															...(args ? { args } : {}),
+															scope: { type: "contract", address: sac },
+														},
+													],
+												}),
+											),
+										),
+									]),
+								)
+							: simulated(
+									installed([
+										{ id: 3, name: "spend", contract: sac, key: keyData },
+									]),
+								),
+				),
+			}) as unknown as rpc.Server
+		store([{ ...spend, to: app }])
+		// A rule by that name that pays anyone isn't the one asked for
+		expect(
+			await checkSession(account, server(undefined), Networks.TESTNET),
+		).toEqual({
+			approved: 0,
+			waiting: 1,
+		})
+		const payee = [{ index: 1, pred: { type: "address-eq", address: app } }]
+		expect(
+			await checkSession(account, server(payee), Networks.TESTNET),
+		).toEqual({
+			approved: 1,
+			waiting: 0,
+		})
+	})
 	it("approves grants found on chain and drops replaced ones", async () => {
 		store([{ ...play, expiresAt: Date.now() + hour }, spend])
-		localStorage.setItem("scaffold:nido-session:pending", account)
-		const rules = [
-			// `play` now names another key: someone approved it again elsewhere
-			{
-				id: 2,
-				name: "play",
-				context_type: ["CallContract", app],
-				signers: [["Delegated", signer]],
-				valid_until: 2_000,
-			},
-			{
-				id: 3,
-				name: "spend",
-				context_type: ["CallContract", sac],
-				signers: [["Delegated", key.publicKey()]],
-				valid_until: 1_720,
-			},
-		]
+		localStorage.setItem(pending, account)
 		const server = {
-			getAccount: vi.fn(async (id: string) => ({
-				accountId: () => id,
-				sequenceNumber: () => "1",
-				incrementSequenceNumber: () => {},
-			})),
-			simulateTransaction: vi.fn(async () => ({
-				latestLedger: 1_000,
-				transactionData: {},
-				result: {
-					retval: nativeToScVal(rules, {
-						type: {
-							id: ["symbol", "u32"],
-							valid_until: ["symbol", "u32"],
-						},
-					}),
-				},
-			})),
+			simulateTransaction: vi.fn(async () =>
+				simulated(
+					installed([
+						// `play` now names another passkey: approved again elsewhere
+						{ id: 2, name: "play", contract: app, key: "04".padEnd(130, "b") },
+						{ id: 3, name: "spend", contract: sac, key: keyData },
+					]),
+				),
+			),
 		} as unknown as rpc.Server
 		expect(await checkSession(account, server, Networks.TESTNET)).toEqual({
 			approved: 1,
@@ -530,7 +730,448 @@ describe("checking the chain for what landed", () => {
 		expect(grant!.label).toBe("spend")
 		// 720 ledgers of five seconds is an hour
 		expect(Math.round((grant!.expiresAt! - Date.now()) / 60_000)).toBe(60)
-		expect(localStorage.getItem("scaffold:nido-session:pending")).toBeNull()
+		expect(localStorage.getItem(pending)).toBeNull()
+	})
+})
+
+describe("a call signed by the app's passkey", () => {
+	const me = new Address(account).toScVal()
+	// A losing guess: `guess` on the game, then 1 XLM from the account
+	const recorded = new xdr.SorobanAuthorizationEntry({
+		credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(
+			new xdr.SorobanAddressCredentials({
+				address: new Address(account).toScAddress(),
+				nonce: xdr.Int64.fromString("7"),
+				signatureExpirationLedger: 0,
+				signature: xdr.ScVal.scvVoid(),
+			}),
+		),
+		rootInvocation: call(app, [call(sac)]),
+	})
+	const func = xdr.HostFunction.hostFunctionTypeInvokeContract(
+		new xdr.InvokeContractArgs({
+			contractAddress: new Address(app).toScAddress(),
+			functionName: "guess",
+			args: [nativeToScVal(3, { type: "u64" }), me],
+		}),
+	)
+	const assembled = {
+		built: new TransactionBuilder(
+			new Account(StrKey.encodeEd25519PublicKey(Buffer.alloc(32)), "0"),
+			{
+				fee: "100",
+				networkPassphrase: Networks.TESTNET,
+			},
+		)
+			.addOperation(Operation.invokeHostFunction({ func, auth: [recorded] }))
+			.setTimeout(30)
+			.build(),
+		options: { parseResultXdr: (v: xdr.ScVal) => scValToNative(v) as boolean },
+	} as unknown as contract.AssembledTransaction<boolean>
+	const txHash = "cd".repeat(32)
+
+	/** The device: signs a WebAuthn assertion over the challenge. */
+	const authenticator = () => {
+		const challenges: Buffer[] = []
+		const get = vi.fn(
+			async ({
+				publicKey,
+			}: {
+				publicKey: PublicKeyCredentialRequestOptions
+			}) => {
+				const challenge = Buffer.from(publicKey.challenge as Uint8Array)
+				challenges.push(challenge)
+				const authenticatorData = Buffer.concat([
+					createHash("sha256").update("localhost").digest(),
+					Buffer.from([0x05, 0, 0, 0, 1]),
+				])
+				const clientDataJSON = Buffer.from(
+					JSON.stringify({
+						type: "webauthn.get",
+						challenge: challenge.toString("base64url"),
+						origin: "http://localhost:5180",
+					}),
+				)
+				const signed = Buffer.concat([
+					authenticatorData,
+					createHash("sha256").update(clientDataJSON).digest(),
+				])
+				return {
+					response: {
+						authenticatorData: Uint8Array.from(authenticatorData).buffer,
+						clientDataJSON: Uint8Array.from(clientDataJSON).buffer,
+						signature: Uint8Array.from(
+							sign("sha256", signed, device.privateKey),
+						).buffer,
+					},
+				}
+			},
+		)
+		vi.stubGlobal("navigator", { credentials: { get } })
+		return { get, challenges }
+	}
+	const network = (refusal?: string) => {
+		const modes: (string | undefined)[] = []
+		const server = {
+			simulateTransaction: vi.fn(
+				async (
+					tx: { operations: Operation.InvokeHostFunction[] },
+					_: unknown,
+					mode?: string,
+				) => {
+					modes.push(mode)
+					if (mode === "enforce")
+						return refusal
+							? { latestLedger: 1_000, error: refusal }
+							: simulated(nativeToScVal(false))
+					const method = tx.operations[0]!.func.invokeContract()
+						.functionName()
+						.toString()
+					return method === "capabilities"
+						? simulated(
+								nativeToScVal(
+									{ auth_digest: "addr_oz_v1" },
+									{ type: { auth_digest: ["symbol", "symbol"] } },
+								),
+							)
+						: simulated(
+								installed([
+									{ id: 2, name: "play", contract: app, key: keyData },
+									{ id: 3, name: "spend", contract: sac, key: keyData },
+								]),
+							)
+				},
+			),
+			pollTransaction: vi.fn(async () => ({
+				status: rpc.Api.GetTransactionStatus.SUCCESS,
+				returnValue: nativeToScVal(false),
+			})),
+		} as unknown as rpc.Server
+		const relayed: { func: string; auth: string[] }[] = []
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (_url: string, init: { body: string }) => {
+				const { params } = JSON.parse(init.body) as {
+					params: { func: string; auth: string[] }
+				}
+				relayed.push(params)
+				return new Response(
+					JSON.stringify({
+						success: true,
+						data: { transactionId: "t1", hash: txHash, status: "confirmed" },
+					}),
+				)
+			}),
+		)
+		return { server, modes, relayed }
+	}
+
+	it("asks the device once and hands the signed call to Nido's relayer", async () => {
+		vi.stubGlobal("window", { location: { hostname: "localhost" } })
+		const { get, challenges } = authenticator()
+		const { server, modes, relayed } = network()
+		const stages: string[] = []
+		const result = await submitWithSession(
+			assembled,
+			{ account, passkey, grants: [] },
+			{ server, networkPassphrase: Networks.TESTNET, relayer: "https://relay" },
+			(stage) => stages.push(stage),
+		)
+		expect(result).toEqual({ result: false, hash: txHash })
+		// What a screen can say while it waits, in order
+		expect(stages).toEqual(["passkey", "sending", "confirming"])
+		expect(get).toHaveBeenCalledOnce()
+		expect(modes).toContain("enforce")
+		expect(relayed).toHaveLength(1)
+		expect(relayed[0]!.func).toBe(func.toXDR("base64"))
+
+		const [entry] = relayed[0]!.auth.map((a) =>
+			xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"),
+		)
+		const creds = entry!.credentials().address()
+		expect(creds.signatureExpirationLedger()).toBe(1_060)
+		const [ids, signers] = creds.signature().map()!
+		const ruleIds = ids!
+			.val()
+			.vec()!
+			.map((v) => v.u32())
+		// One rule per authorized contract, in tree order
+		expect(ruleIds).toEqual([2, 3])
+		const [signer] = signers!.val().map()!
+		const [tag, by, key] = signer!.key().vec()!
+		expect(tag!.sym().toString()).toBe("External")
+		expect(Address.fromScVal(by!).toString()).toBe(verifier)
+		expect(key!.bytes().toString("hex")).toBe(keyData)
+
+		// The challenge is the digest the account recomputes for this entry
+		const payload = hash(
+			xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
+				new xdr.HashIdPreimageSorobanAuthorization({
+					networkId: hash(Networks.TESTNET),
+					nonce: xdr.Int64.fromString("7"),
+					signatureExpirationLedger: 1_060,
+					invocation: entry!.rootInvocation(),
+				}),
+			).toXDR(),
+		)
+		expect(challenges[0]).toEqual(
+			Buffer.from(await authDigest(account, payload, ruleIds, "addr_oz_v1")),
+		)
+		// …and the signature data is OZ's WebAuthnSigData over it
+		const sig = scValToNative(
+			xdr.ScVal.fromXDR(signer!.val().bytes()),
+		) as Record<string, Buffer>
+		expect(JSON.parse(sig.client_data!.toString()).challenge).toBe(
+			challenges[0]!.toString("base64url"),
+		)
+		expect(
+			verify(
+				"sha256",
+				Buffer.concat([
+					sig.authenticator_data!,
+					createHash("sha256").update(sig.client_data!).digest(),
+				]),
+				{ key: device.publicKey, dsaEncoding: "ieee-p1363" },
+				sig.signature!,
+			),
+		).toBe(true)
+		expect(
+			webAuthnSigData({
+				authenticatorData: sig.authenticator_data!,
+				clientDataJson: sig.client_data!,
+				signature: sig.signature!,
+			}),
+		).toEqual(signer!.val().bytes())
+	})
+	it("refuses over the cap before the device is asked, and remembers until when", async () => {
+		vi.stubGlobal("window", { location: { hostname: "localhost" } })
+		const { get } = authenticator()
+		const policy = StrKey.encodeContract(Buffer.alloc(32, 7))
+		const doc = JSON.stringify({
+			rules: [
+				{
+					name: "play",
+					functions: ["guess"],
+					scope: { type: "contract", address: app },
+				},
+				{
+					name: "spend",
+					functions: ["transfer"],
+					cap: { limit: "20000000", "period-ledgers": 17280 },
+					scope: { type: "contract", address: sac },
+				},
+			],
+		})
+		// Two 1 XLM guesses already in today's window
+		let spent = [
+			{ amount: 10_000_000n, ledger: 900 },
+			{ amount: 10_000_000n, ledger: 950 },
+		]
+		const window = () =>
+			nativeToScVal(
+				{
+					cached_total_spent: nativeToScVal(
+						spent.reduce((a, e) => a + e.amount, 0n),
+						{ type: "i128" },
+					),
+					period_ledgers: nativeToScVal(17_280, { type: "u32" }),
+					spending_history: xdr.ScVal.scvVec(
+						spent.map((e) =>
+							nativeToScVal(
+								{
+									amount: nativeToScVal(e.amount, { type: "i128" }),
+									ledger_sequence: nativeToScVal(e.ledger, { type: "u32" }),
+								},
+								{
+									type: {
+										amount: ["symbol", null],
+										ledger_sequence: ["symbol", null],
+									},
+								},
+							),
+						),
+					),
+					spending_limit: nativeToScVal(20_000_000n, { type: "i128" }),
+				},
+				{
+					type: {
+						cached_total_spent: ["symbol", null],
+						period_ledgers: ["symbol", null],
+						spending_history: ["symbol", null],
+						spending_limit: ["symbol", null],
+					},
+				},
+			)
+		const keys: xdr.LedgerKey[] = []
+		const { server, relayed } = network()
+		const reads = server.simulateTransaction as unknown as ReturnType<
+			typeof vi.fn
+		>
+		const original = reads.getMockImplementation() as (
+			...args: unknown[]
+		) => Promise<unknown>
+		reads.mockImplementation(
+			async (
+				tx: { operations: Operation.InvokeHostFunction[] },
+				l: unknown,
+				mode?: string,
+			) => {
+				const method = tx.operations[0]!.func.invokeContract()
+					.functionName()
+					.toString()
+				if (method === "document")
+					return simulated(
+						xdr.ScVal.scvVec([
+							nativeToScVal(1, { type: "u64" }),
+							nativeToScVal(Buffer.from(doc)),
+						]),
+					)
+				if (method === "installed_rules")
+					return simulated(
+						nativeToScVal(
+							[
+								{ id: 2, name: "play", target: app, policies: [] },
+								{ id: 3, name: "spend", target: sac, policies: [policy] },
+							].map(({ id, name, target, policies }) => ({
+								context_type: xdr.ScVal.scvVec([
+									xdr.ScVal.scvSymbol("CallContract"),
+									new Address(target).toScVal(),
+								]),
+								id: nativeToScVal(id, { type: "u32" }),
+								name,
+								policies: xdr.ScVal.scvVec(
+									policies.map((p) =>
+										nativeToScVal(
+											{ policy: new Address(p).toScVal() },
+											{ type: { policy: ["symbol", null] } },
+										),
+									),
+								),
+								signers: xdr.ScVal.scvVec([
+									xdr.ScVal.scvVec([
+										xdr.ScVal.scvSymbol("External"),
+										new Address(verifier).toScVal(),
+										nativeToScVal(Buffer.from(keyData, "hex")),
+									]),
+								]),
+								valid_until: nativeToScVal(1_720, { type: "u32" }),
+							})),
+							{ type: { id: ["symbol", null] } },
+						),
+					)
+				return original(tx, l, mode)
+			},
+		)
+		Object.assign(server, {
+			getLedgerEntries: vi.fn(async (...asked: xdr.LedgerKey[]) => {
+				keys.push(...asked)
+				return { entries: [{ val: { contractData: () => ({ val: window }) } }] }
+			}),
+		})
+		// A losing guess: `guess` on the game, then 1 XLM to the game
+		const me = new Address(account).toScVal()
+		const fn = (
+			contract: string,
+			name: string,
+			args: xdr.ScVal[],
+			subs: xdr.SorobanAuthorizedInvocation[] = [],
+		) =>
+			new xdr.SorobanAuthorizedInvocation({
+				function:
+					xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
+						new xdr.InvokeContractArgs({
+							contractAddress: new Address(contract).toScAddress(),
+							functionName: name,
+							args,
+						}),
+					),
+				subInvocations: subs,
+			})
+		const entry = new xdr.SorobanAuthorizationEntry({
+			credentials: recorded.credentials(),
+			rootInvocation: fn(
+				app,
+				"guess",
+				[nativeToScVal(3, { type: "u64" }), me],
+				[
+					fn(sac, "transfer", [
+						me,
+						new Address(app).toScVal(),
+						nativeToScVal(10_000_000n, { type: "i128" }),
+					]),
+				],
+			),
+		})
+		const guessing = {
+			...assembled,
+			built: new TransactionBuilder(
+				new Account(StrKey.encodeEd25519PublicKey(Buffer.alloc(32)), "0"),
+				{
+					fee: "100",
+					networkPassphrase: Networks.TESTNET,
+				},
+			)
+				.addOperation(Operation.invokeHostFunction({ func, auth: [entry] }))
+				.setTimeout(30)
+				.build(),
+		} as unknown as contract.AssembledTransaction<boolean>
+		store([
+			{ ...play, expiresAt: Date.now() + hour },
+			{ ...spend, expiresAt: Date.now() + hour },
+		])
+		const session = loadSession(account)!
+		const submit = () =>
+			submitWithSession(guessing, loadSession(account)!, {
+				server,
+				networkPassphrase: Networks.TESTNET,
+				relayer: "https://relay",
+			})
+
+		const refusal = await submit().catch((e: unknown) => e)
+		expect(refusal).toBeInstanceOf(CapReachedError)
+		expect(isOverCap(refusal)).toBe(true)
+		expect(get).not.toHaveBeenCalled()
+		expect(relayed).toHaveLength(0)
+		// The cap's own record, keyed by account and the XLM rule's id
+		const [key] = keys.map((k) => k.contractData())
+		expect(Address.fromScAddress(key!.contract()).toString()).toBe(policy)
+		expect(scValToNative(key!.key())).toEqual(["AccountContext", account, 3])
+		// Free again once the 900 spend is a day old: 17,180 ledgers from 1,000
+		const until = (refusal as CapReachedError).until!
+		expect(Math.round((until - Date.now()) / 60_000)).toBe(
+			Math.round((17_180 * 5) / 60),
+		)
+		expect(capReachedUntil(account, [play, spend])).toBe(until)
+		expect(capReachedUntil(account, [play])).toBeUndefined()
+
+		// A guess that fits clears it
+		spent = []
+		await submit()
+		expect(get).toHaveBeenCalledOnce()
+		expect(capReachedUntil(account, [spend])).toBeUndefined()
+		expect(session.passkey).toEqual(passkey)
+	})
+	it("forgets a spent cap once its grant is approved again", () => {
+		store([{ ...spend }], { capped: { spend: Date.now() + hour } })
+		localStorage.setItem(pending, account)
+		browser("http://localhost:5180/?delegation=ok")
+		expect(resumeSession()).toMatchObject({ outcome: "approved" })
+		expect(capReachedUntil(account, [spend])).toBeUndefined()
+	})
+	it("sends nothing when the account refuses, as over the cap", async () => {
+		vi.stubGlobal("window", { location: { hostname: "localhost" } })
+		authenticator()
+		const { server, relayed } = network("HostError: Error(Contract, #3221)")
+		const stages: string[] = []
+		const refused = submitWithSession(
+			assembled,
+			{ account, passkey, grants: [] },
+			{ server, networkPassphrase: Networks.TESTNET, relayer: "https://relay" },
+			(stage) => stages.push(stage),
+		)
+		await expect(refused).rejects.toSatisfy(isOverCap)
+		expect(relayed).toHaveLength(0)
+		expect(stages).toEqual(["passkey", "sending"])
 	})
 })
 
@@ -545,6 +1186,10 @@ describe("describing errors", () => {
 		expect(isOverCap("Error(Contract, #3002)")).toBe(false)
 		expect(explain("relay: FEE_LIMIT_EXCEEDED")).toMatch(/budget/)
 		expect(explain("POOL_CAPACITY")).toMatch(/busy/)
+		const dismissed = Object.assign(new Error("The operation was aborted"), {
+			name: "NotAllowedError",
+		})
+		expect(explain(dismissed)).toMatch(/passkey prompt was dismissed/)
 		expect(explain("HostError: Error(Contract, #4)", errors)).toBe(
 			"The contract refused: Already claimed",
 		)

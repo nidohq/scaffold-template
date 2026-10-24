@@ -11,11 +11,15 @@ import {
 	rpc,
 	scValToNative,
 } from "@stellar/stellar-sdk"
+import { type SubmitStage } from "./session"
 
 export const isSmartAccount = StrKey.isValidContract
 
 /** Hosted Nido's testnet wallet; apps override it with `PUBLIC_NIDO_BASE`. */
 export const NIDO_BASE = "https://test.nido.fyi"
+
+/** Hosted Nido's testnet relayer; apps override it with `PUBLIC_NIDO_RELAYER`. */
+export const NIDO_RELAYER = "https://nido.fly.dev"
 
 // Hosted Nido is testnet-only. Do not advertise it on incompatible networks.
 export function createNidoModules(passphrase: string, base = NIDO_BASE) {
@@ -71,11 +75,14 @@ export async function submitSmartAccount<T>(
 		opts: { address: string; networkPassphrase: string },
 	) => Promise<WalletSignResult>,
 	server: rpc.Server,
+	onStage?: (stage: SubmitStage) => void,
 ): Promise<{ result: T; hash: string }> {
+	onStage?.("wallet")
 	const response = await sign(tx.toXDR(), {
 		address,
 		networkPassphrase: tx.options.networkPassphrase,
 	})
+	onStage?.("confirming")
 	if (!response.submitted) {
 		throw new Error(
 			"This Nido deployment returned signed XDR without submitting. Use a Nido deployment with relayer support.",

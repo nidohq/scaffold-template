@@ -18,5 +18,24 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+      # The action reads the SBOM from GitHub's dependency graph, which a new
+      # repository may have off; it then fails on every push (404). Skip with
+      # a notice instead, until the graph is on.
+      - name: Check the dependency graph is on
+        id: graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          status=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/dependency-graph/sbom")
+          if [ "$status" = 200 ]; then
+            echo "on=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=No SBOM submitted::The dependency graph is off for ${REPO} (HTTP ${status}). Turn it on under Settings > Code security > Dependency graph to submit an SBOM to PG Atlas."
+          fi
       - name: Fetch and submit SBOM
+        if: steps.graph.outputs.on == 'true'
         uses: SCF-Public-Goods-Maintenance/pg-atlas-sbom-action@main

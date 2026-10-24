@@ -1,11 +1,11 @@
-import { expect, test } from "@playwright/test"
+import { expect, test, type Page } from "@playwright/test"
+import { createHash, createPublicKey, verify } from "node:crypto"
 import {
 	Address,
 	Asset,
-	Keypair,
 	Networks,
-	StrKey,
 	nativeToScVal,
+	scValToNative,
 	xdr,
 } from "@stellar/stellar-sdk"
 import {
@@ -14,15 +14,20 @@ import {
 	connect,
 	invocation,
 	mockServices,
+	recordStatuses,
+	statuses,
+	verifier,
+	virtualAuthenticator,
 	type GrantAnswer,
 } from "./mocks"
 
-// The Guess the Number sample: a Nido account approves a session, then
-// guesses without a prompt. `npm run new-app -- --blank` removes this file
-// with the sample.
+// The Guess the Number sample: a Nido account approves the game's own
+// passkey once, then each guess asks the device and nothing else.
+// `npm run new-app -- --blank` removes this file with the sample.
 
 const sac = Asset.native().contractId(Networks.TESTNET)
-const approve = "Approve with Nido (2 confirmations)"
+const makePasskey = "Make a passkey for this app"
+const approve = "Approve with Nido (2 rules, one confirmation)"
 
 /** The account's auth for a losing guess: `guess`, then 1 XLM to the game. */
 const guessAuth = (method: string, game: string) => {
@@ -46,25 +51,34 @@ const guessAuth = (method: string, game: string) => {
 	]
 }
 
-/** A passkey-signed `apply_doc` on the account, as Nido would hand it back. */
-const signedApproval = () =>
-	Buffer.from(
-		JSON.stringify({
-			func: xdr.HostFunction.hostFunctionTypeInvokeContract(
-				new xdr.InvokeContractArgs({
-					contractAddress: new Address(account).toScAddress(),
-					functionName: "apply_doc",
-					args: [nativeToScVal("policy document")],
-				}),
-			).toXDR("base64"),
-			auth: [accountAuth(invocation(account, "apply_doc", [])).toXDR("base64")],
-		}),
-	).toString("base64url")
+/** Count the app's requests for a passkey signature. */
+const countPrompts = (page: Page) =>
+	page.addInitScript(() => {
+		const w = window as unknown as { prompts: number }
+		w.prompts = 0
+		const get = navigator.credentials.get.bind(navigator.credentials)
+		navigator.credentials.get = (options) => {
+			w.prompts++
+			return get(options)
+		}
+	})
+const prompts = (page: Page) =>
+	page.evaluate(() => (window as unknown as { prompts: number }).prompts)
 
-async function guess(page: import("@playwright/test").Page) {
-	await page.getByPlaceholder("Guess a number from 1 to 10!").fill("3")
+/** Guess `n`; a number other than the last one clears the last result. */
+async function guess(page: Page, n: number, expected = "You got it!") {
+	await page.getByPlaceholder("Guess a number from 1 to 10!").fill(String(n))
 	await page.getByRole("button", { name: "Submit", exact: true }).click()
-	await expect(page.getByText("You got it!", { exact: false })).toBeVisible()
+	await expect(page.locator(".guess-result")).toContainText(expected)
+}
+
+/** Make the game's passkey and approve it in Nido's popup. */
+async function approveOnce(page: Page) {
+	await page.getByRole("button", { name: makePasskey }).click()
+	const popup = page.waitForEvent("popup")
+	await page.getByRole("button", { name: approve }).click()
+	await popup
+	await expect(page.getByText("This app's passkey may act")).toBeVisible()
 }
 
 test("the guess form is on the home page", async ({ page }) => {
@@ -75,130 +89,238 @@ test("the guess form is on the home page", async ({ page }) => {
 	await expect(page.getByRole("button", { name: "Submit" })).toBeVisible()
 })
 
-test("a Nido account approves a session once, then guesses without a popup", async ({
+test("a Nido account approves the game's passkey once, then each guess asks only the device", async ({
 	page,
 	context,
 }) => {
-	const { calls, grants, sent } = await mockServices(context, {
+	const { requests, relayed, sent } = await mockServices(context, {
 		auth: guessAuth,
+		relayDelay: 800,
 	})
+	const credentials = await virtualAuthenticator(page)
+	await countPrompts(page)
+	await recordStatuses(page)
 	await connect(page)
 	await expect(
 		page.getByPlaceholder("Guess a number from 1 to 10!"),
 	).toHaveCount(0)
-	await page.getByRole("button", { name: approve }).click()
-	await expect(page.getByText("This app holds a session key")).toBeVisible()
+	await approveOnce(page)
 	expect(page.url()).not.toContain("delegation")
 
-	// One rule per contract a losing guess touches; only the XLM rule is capped
-	const [game, xlm] = grants.map((g) => Object.fromEntries(g))
-	const signer = game!.signer!
-	expect(Keypair.fromPublicKey(signer).publicKey()).toBe(signer)
-	expect(game).toMatchObject({
-		functions: "guess",
+	// One request, one rule per contract a losing guess touches, both for the
+	// passkey the device just made; only the XLM rule is capped
+	expect(requests).toHaveLength(1)
+	const [game, xlm] = requests[0]!
+	const [credential] = await credentials()
+	const publicKey = createPublicKey({
+		key: Buffer.from(credential!.privateKey, "base64"),
+		format: "der",
+		type: "pkcs8",
+	})
+	const pubkey = publicKey
+		.export({ format: "der", type: "spki" })
+		.subarray(-65)
+		.toString("hex")
+	expect(game).toEqual({
+		pubkey,
 		duration: "24h",
 		label: "guess",
+		target: expect.stringMatching(/^C/),
+		functions: "guess",
+		limit: "none",
 	})
-	expect(game).not.toHaveProperty("limit")
-	expect(xlm).toMatchObject({
+	// …and the XLM rule pays only the game
+	expect(xlm).toEqual({
+		pubkey,
+		duration: "24h",
+		label: "guess-xlm",
 		target: sac,
-		signer,
 		functions: "transfer",
 		limit: "2",
 		limit_period: "day",
+		to: game!.target,
 	})
+	// Nothing secret in the browser: the passkey's public half only
+	const stored = await page.evaluate(
+		(a) => localStorage.getItem(`scaffold:nido-session:${a}`),
+		account,
+	)
+	expect(stored).toContain(pubkey)
+	expect(stored).not.toMatch(/secret|"S[A-Z2-7]{55}"/)
 
 	let popups = 0
 	page.on("popup", () => popups++)
-	await guess(page)
+	// From Submit to the result, the player sees what the guess waits for,
+	// and can't change or resubmit it
+	const input = page.getByPlaceholder("Guess a number from 1 to 10!")
+	await input.fill("3")
+	await page.getByRole("button", { name: "Submit", exact: true }).click()
+	await expect(page.getByRole("button", { name: "Guessing…" })).toBeDisabled()
+	await expect(input).toHaveAttribute("readonly")
+	await expect(page.getByRole("status").last()).toHaveText(
+		/Sending…|Confirming on Stellar…/,
+	)
+	await expect(page.locator(".guess-result")).toContainText("You got it!")
+	await expect(page.getByRole("button", { name: "Submit" })).toBeEnabled()
+	await expect(input).not.toHaveAttribute("readonly")
+	const seen = await statuses(page)
+	const order = [
+		"Waiting for your passkey: your device makes one for this app…",
+		"Waiting for Nido: approve in its window, which closes once the rules are on Stellar…",
+		"Preparing…",
+		"Waiting for your passkey…",
+		"Sending…",
+		"Confirming on Stellar…",
+	]
+	expect(seen.filter((s) => order.includes(s))).toEqual(order)
+	expect(await prompts(page)).toBe(1)
 	expect(popups).toBe(0)
-	expect(calls).toContain("getTransaction")
 	await expect(page.getByText(/^Transaction [0-9a-f]{64}$/)).toBeVisible()
 
-	// The key signs inside the account's own entry (CAP-0071), naming the
-	// approved rule for each authorized contract, in tree order.
-	const op = sent[0]!.v1().tx().operations()[0]!
-	const [entry] = op.body().invokeHostFunctionOp().auth()
-	const creds = entry!.credentials()
-	expect(creds.switch().name).toBe("sorobanCredentialsAddressWithDelegates")
-	const delegates = creds.addressWithDelegates()
-	const payload = delegates.addressCredentials().signature().map()!
+	// Nido's relayer submits; the app sends no transaction of its own
+	expect(relayed).toHaveLength(1)
+	expect(sent).toHaveLength(0)
+	const [entry] = relayed[0]!.auth.map((a) =>
+		xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"),
+	)
+	const creds = entry!.credentials().address()
+	const [ids, signers] = creds.signature().map()!
+	// The approved rule for each authorized contract, in tree order
 	expect(
-		payload[0]!
+		ids!
 			.val()
 			.vec()!
 			.map((id) => id.u32()),
 	).toEqual([2, 3])
+	const [signer] = signers!.val().map()!
+	const [tag, by, key] = signer!.key().vec()!
+	expect(tag!.sym().toString()).toBe("External")
+	expect(Address.fromScVal(by!).toString()).toBe(verifier)
+	expect(key!.bytes().toString("hex")).toBe(pubkey)
+	// The browser's own WebAuthn assertion, which the verifier checks
+	const sig = scValToNative(xdr.ScVal.fromXDR(signer!.val().bytes())) as Record<
+		string,
+		Buffer
+	>
+	const client = JSON.parse(sig.client_data!.toString()) as Record<
+		string,
+		string
+	>
+	expect(client).toMatchObject({
+		type: "webauthn.get",
+		origin: new URL(page.url()).origin,
+	})
+	expect(sig.authenticator_data![32]! & 0x05).toBe(0x05) // present, verified
 	expect(
-		Address.fromScAddress(delegates.delegates()[0]!.address()).toString(),
-	).toBe(signer)
+		verify(
+			"sha256",
+			Buffer.concat([
+				sig.authenticator_data!,
+				createHash("sha256").update(sig.client_data!).digest(),
+			]),
+			{ key: publicKey, dsaEncoding: "ieee-p1363" },
+			sig.signature!,
+		),
+	).toBe(true)
+
+	await guess(page, 5)
+	expect(await prompts(page)).toBe(2)
+	expect(popups).toBe(0)
 	await page.screenshot({
 		path: "../screenshots/nido-session.png",
 		fullPage: true,
 	})
 })
 
-test("over the 2 XLM cap, the account refuses and the player is told why", async ({
+test("over the 2 XLM cap, the guess stops before the device is asked, and Submit waits for the cap", async ({
 	page,
 	context,
 }) => {
-	let overCap = false
-	await mockServices(context, {
-		auth: guessAuth,
-		refuse: () => (overCap ? "HostError: Error(Contract, #3221)" : undefined),
-	})
+	const { relayed } = await mockServices(context, { auth: guessAuth })
+	await virtualAuthenticator(page)
+	await countPrompts(page)
 	await connect(page)
-	await page.getByRole("button", { name: approve }).click()
-	await expect(page.getByText("This app holds a session key")).toBeVisible()
-	await guess(page)
+	await approveOnce(page)
+	await guess(page, 3)
+	await guess(page, 5)
+	expect(relayed).toHaveLength(2)
 
-	overCap = true
-	let popups = 0
-	page.on("popup", () => popups++)
-	await page.getByPlaceholder("Guess a number from 1 to 10!").fill("3")
-	await page.getByRole("button", { name: "Submit", exact: true }).click()
+	// The cap's record says 2 XLM went out today: no prompt, nothing sent
+	await guess(page, 7, "the 2 XLM a day you let this game spend")
 	await expect(page.getByRole("alert")).toContainText(
-		"the 2 XLM a day you let this game spend",
+		"stopped before your device was asked",
 	)
-	expect(popups).toBe(0)
+	expect(await prompts(page)).toBe(2)
+	expect(relayed).toHaveLength(2)
+	await expect(page.locator(".guess-the-number .pending")).toHaveCount(0)
+	// It says when guessing works again, and doesn't let the player try sooner,
+	// even after a reload
+	const capped = page.getByText(/^Cap reached until ≈ /)
+	await expect(capped).toBeVisible()
+	await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled()
+	await page.reload()
+	await expect(capped).toBeVisible()
+	await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled()
+
+	// Once the approval expires, the renew screen replaces the form and
+	// the last result with it
+	await page.getByPlaceholder("Guess a number from 1 to 10!").fill("2")
+	await page.evaluate((a) => {
+		const key = `scaffold:nido-session:${a}`
+		const session = JSON.parse(localStorage.getItem(key)!) as {
+			grants: { expiresAt?: number }[]
+		}
+		for (const grant of session.grants) grant.expiresAt = Date.now() - 1_000
+		localStorage.setItem(key, JSON.stringify(session))
+		dispatchEvent(new Event("scaffold:nido-session-change"))
+	}, account)
+	await expect(
+		page.getByRole("button", { name: /^Renew with Nido/ }),
+	).toBeVisible()
+	await expect(page.locator(".guess-result")).toHaveCount(0)
+	await expect(capped).toHaveCount(0)
 })
 
-test("a cancelled grant keeps the app's key for the next try", async ({
+test("a cancelled approval keeps the game's passkey for the next try", async ({
 	page,
 	context,
 }) => {
 	let cancel = true
-	const { grants, funded } = await mockServices(context, {
+	const { requests } = await mockServices(context, {
 		grantAnswer: () =>
 			cancel
 				? { answer: "?delegation=cancelled", landed: false }
 				: { answer: "?delegation=ok", landed: true },
 	})
+	const credentials = await virtualAuthenticator(page)
 	await connect(page)
+	await page.getByRole("button", { name: makePasskey }).click()
 	await page.getByRole("button", { name: approve }).click()
 	await expect(
 		page.getByText("The session request was cancelled"),
 	).toBeVisible()
 	cancel = false
 	await page.getByRole("button", { name: approve }).click()
-	await expect(page.getByText("This app holds a session key")).toBeVisible()
-	// Friendbot funded one key, and every grant names it
-	expect(funded).toHaveLength(1)
-	expect(new Set(grants.map((g) => g.get("signer")))).toEqual(new Set(funded))
+	await expect(page.getByText("This app's passkey may act")).toBeVisible()
+	// One passkey, named by both requests
+	expect(await credentials()).toHaveLength(1)
+	expect(new Set(requests.flat().map((g) => g.pubkey)).size).toBe(1)
 })
 
 test("when Nido's relayer refuses, the app says so and can check the chain", async ({
 	page,
 	context,
 }) => {
-	// The second grant: Nido's page fails to confirm, but the rule landed
-	// (a gateway timeout after submission).
-	const grantAnswer: GrantAnswer = (_, i) =>
-		i === 0
-			? { answer: "?delegation=ok", landed: true }
-			: { answer: "?delegation=error&code=FEE_LIMIT_EXCEEDED", landed: true }
+	// Nido's page fails to confirm, but the rules landed (a gateway timeout
+	// after submission)
+	const grantAnswer: GrantAnswer = () => ({
+		answer: "?delegation=error&code=FEE_LIMIT_EXCEEDED",
+		landed: true,
+	})
 	await mockServices(context, { grantAnswer })
+	await virtualAuthenticator(page)
 	await connect(page)
+	await page.getByRole("button", { name: makePasskey }).click()
 	await page.getByRole("button", { name: approve }).click()
 	await expect(page.getByRole("alert").first()).toContainText(
 		"budget is used up",
@@ -207,36 +329,8 @@ test("when Nido's relayer refuses, the app says so and can check the chain", asy
 		"guess-xlm",
 	)
 	await page.getByRole("button", { name: "Check again" }).click()
-	await expect(page.getByText("This app holds a session key")).toBeVisible()
+	await expect(page.getByText("This app's passkey may act")).toBeVisible()
 	await expect(
 		page.getByPlaceholder("Guess a number from 1 to 10!"),
 	).toBeVisible()
-})
-
-test("an approval Nido couldn't relay is paid for by the app's own key", async ({
-	page,
-	context,
-}) => {
-	const grantAnswer: GrantAnswer = (_, i) =>
-		i === 0
-			? { answer: "?delegation=ok", landed: true }
-			: {
-					answer: `?delegation=signed#payload=${signedApproval()}`,
-					landed: false,
-				}
-	const { sent, landed, funded } = await mockServices(context, {
-		grantAnswer,
-		auth: guessAuth,
-	})
-	await connect(page)
-	await page.getByRole("button", { name: approve }).click()
-	await expect(page.getByText(/this app's key paid/)).toBeVisible()
-	expect(landed).toHaveLength(2)
-	// Submitted and paid for by the session key Friendbot funded
-	const tx = sent[0]!.v1().tx()
-	expect(StrKey.encodeEd25519PublicKey(tx.sourceAccount().ed25519())).toBe(
-		funded[0],
-	)
-	expect(page.url()).not.toContain("payload")
-	await guess(page)
 })

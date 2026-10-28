@@ -45,7 +45,7 @@ without an error (it compiles and writes no clients), so the wrapper refuses it;
   `@stellar-scaffold/app-lib/clients`; never edit them.
 - `app-lib/` — the wallet layer: `wallet.ts` (kit, `submitCall`,
   `submitContract`, balances), `nido.ts` (Nido popup path), `session.ts`
-  (session keys, coverage, `describe`).
+  (session passkeys, coverage, `describe`).
 - `app/src/` — React UI. `components/SessionGate.tsx` asks a Nido account for a
   session; `components/GuessTheNumber.tsx` (or `CheckIn.tsx` in a `--blank` app)
   is the reference call site.
@@ -116,16 +116,26 @@ export const MyAction = () => {
 
 - `submitCall` = `reserveSigningPopup` + `transactionSource` (a C-address can't
   be a transaction source) + `submitContract` + release. It always resolves
-  `{ result, hash }`: G-address via the wallet, C-address via its session key,
-  otherwise Nido's popup.
+  `{ result, hash }`: G-address via the wallet, C-address via the app's session
+  passkey (one device prompt, submitted by Nido's relayer), otherwise Nido's
+  popup. Its third argument `{ onStage }` reports `preparing`,
+  `passkey`/`wallet`, `sending`, `confirming`; show them with `Pending` and
+  `stageText` (`app/src/components/Pending.tsx`), cleared in a `finally`. Use
+  `onSubmit`, not a form `action` (React defers an action's state updates).
 - `SessionGate` compares `grants` with what the account approved
   (`sessionStatus`/`sessionCovers`: target, functions, cap, expiry) and shows
-  ask / renew / waiting states; `actionsOnly` keeps children visible but
-  disabled. Several gates share one key; each asks only for what it lacks.
+  make-passkey / ask / renew / waiting states; `actionsOnly` keeps children
+  visible but disabled. Several gates share one passkey; each asks only for what
+  it lacks, all of it in one Nido popup and one confirmation.
 - `describe(error, contractErrors)`: #3221 over the cap, #3002/#3016 no rule or
   expired, #3014 an uncovered contract in the tree, Nido relayer codes, and your
   contract's `Error(Contract, #n)`.
-- `isOverCap(error)`: the #3221 refusal, for a message that names your cap.
+- `isOverCap(error)`: the #3221 refusal, for a message that names your cap. A
+  call over a cap stops before the passkey prompt (`CapReachedError`, `until`);
+  `capReachedUntil(address, grants)` says until when, to keep a button off.
+- Rules are picked per call by contract and function (from the account's
+  `document()`), preferring this app's grant labels over other rules on the same
+  contract.
 - `isSmartAccount(address)` tells a C-address from a G-address.
 
 ## Smart accounts (C-addresses): what works
@@ -137,17 +147,26 @@ contract, #3014 for several). An app acts for a Nido account through a session.
 
 - One `Grant` per contract the account authorizes in the call: the root call,
   plus every sub-call that needs the same account's `require_auth` (e.g. a token
-  `transfer` from the user). The owner approves each grant with their passkey on
-  Nido's page, then comes back here.
+  `transfer` from the user). The owner approves all of them at once in Nido's
+  popup (`grant.<i>.*` on `/security/delegate-doc/`), with one passkey
+  confirmation.
 - `limit` caps cumulative `transfer(from, to, amount)` amounts and only works on
   a grant whose `target` is that token contract (`xlmTokenId` for XLM). A grant
-  without a cap makes Nido ask the owner to accept "no cap" explicitly.
+  without `limit` is sent as `limit=none`; Nido asks the owner to accept "no
+  cap" unless its `functions` move no tokens.
+- `to` (on a grant whose `functions` are exactly `["transfer"]`) is the only
+  address that transfer may pay: an `address-eq` on argument 1. Set it to your
+  contract for a payment grant; without it the passkey can pay anyone up to the
+  cap, because rules are checked per call, not per call tree.
 - `label` ≤ 20 bytes; asking again with the same label replaces that rule.
-  `duration` is `24h`, `7d` or `30d`.
-- The session key is a classic ed25519 key in the origin's localStorage, funded
-  by Friendbot to pay fees (Nido's relayer cannot submit its CAP-0071 entries
-  yet). It never holds the user's funds. Origins include the port, so a moved
-  dev server has no session: keep `PORT` fixed.
+  `duration` is `24h`, `7d` or `30d`, shared by the grants of one request.
+- The session signer is a second passkey the device makes for the app on its own
+  origin (`createAppPasskey`), named in the rules as an `External` signer. The
+  browser keeps only its public key and credential id: nothing there can spend.
+  Each session call asks the device once and goes through Nido's relayer, which
+  pays the fee. Origins include the port, so a moved dev server has no session:
+  keep `PORT` fixed. Browsers refuse passkeys on an IP, so open the app at
+  `localhost`, not `127.0.0.1`.
 - Keep `from.require_auth()` at the top of the function that moves the user's
   tokens, and ask for one grant per contract. Skipping it to rely on the token's
   own check makes the auth non-root, and simulation (recording mode, which
@@ -159,14 +178,13 @@ contract, #3014 for several). An app acts for a Nido account through a session.
 
 Account creation and grants go through Nido's relayer, which has one shared
 testnet budget (100 XLM a day; a first grant bids about 4.5 XLM, a capped one
-about 2.7). Its grant page shows "We couldn't confirm what happened…" for a 429
-`FEE_LIMIT_EXCEEDED` (nothing sent), a 503 `POOL_CAPACITY` (nothing sent) and a
-504 (may have landed). Recover from the app, not by retrying blindly: back in
-the app, the gate's **Check again** reads `installed_rules` and records any
-grant that landed; **Ask Nido again** reuses the key. `resumeSession` also
-handles `delegation=error&code=…` and `delegation=signed&payload=…`, where the
-session key submits Nido's passkey-signed `{func, auth}` and pays the fee
-itself. Nido doesn't send those two answers yet.
+about 2.7). Session calls go through it too. Its grant page shows "We couldn't
+confirm what happened…" for a 429 `FEE_LIMIT_EXCEEDED` (nothing sent), a 503
+`POOL_CAPACITY` (nothing sent) and a 504 (may have landed). Recover from the
+app, not by retrying blindly: the gate's **Check again** reads `installed_rules`
+and records any grant that landed; **Ask Nido again** reuses the passkey.
+`delegation=error&code=…` becomes a sentence; when the popup was blocked and the
+page went to Nido, `resumeSession` reads the answer on return.
 
 ## Testing with a real Nido account
 

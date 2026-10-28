@@ -12,8 +12,8 @@ const time = new Intl.DateTimeFormat(undefined, {
 	minute: "2-digit",
 })
 
-/** One line, once per page, while this app holds a session key for the
- * connected Nido account. */
+/** One line, once per page, while this app's passkey holds an approved
+ * session for the connected Nido account. */
 export const SessionNote = () => {
 	const { address } = useWallet()
 	const now = useSessionClock()
@@ -27,13 +27,13 @@ export const SessionNote = () => {
 	)
 	return (
 		<p className="session-note">
-			This app holds a session key for your account
+			This app&apos;s passkey may act for your account
 			{until < Number.MAX_SAFE_INTEGER &&
 				`, approved until ${time.format(until)}`}
-			.{" "}
+			, asking your device each time.{" "}
 			<button
 				type="button"
-				title="Deletes this browser's copy of the key. The rules stay on your account until they expire; approving again replaces them."
+				title="This browser forgets the app's passkey; your device may still list it. The rules stay on your account until they expire; approving again with a new passkey replaces them."
 				onClick={() => forgetSession(address)}
 			>
 				Forget it

@@ -14,7 +14,7 @@ smart-account rules are in [`../AGENTS.md`](../AGENTS.md); read it first.
   `balances`, `networkPassphrase`, `isPending`, `signTransaction`, and
   `updateBalances`; read them with `src/hooks/useWallet.ts`.
 - Wallet primitives (kit setup, connect, `submitContract`, balances, session
-  keys) live in `app-lib`, not here.
+  passkeys) live in `app-lib`, not here.
 
 ## Routes
 

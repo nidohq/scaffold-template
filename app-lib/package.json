@@ -9,7 +9,7 @@
     "./clients": "./clients/index.ts"
   },
   "dependencies": {
-    "@creit.tech/stellar-wallets-kit": "^2.5.0",
+    "@creit.tech/stellar-wallets-kit": "^2.7.1",
     "@nidohq/stellar-wallets-kit-module": "0.1.1-spike",
     "@stellar/stellar-sdk": "^16.4.0"
   }

@@ -7,7 +7,7 @@
     ".": "./index.ts"
   },
   "peerDependencies": {
-    "@creit.tech/stellar-wallets-kit": "^2.5.0",
+    "@creit.tech/stellar-wallets-kit": "^2.7.1",
     "@stellar/stellar-sdk": "^16.1.0"
   }
 }
